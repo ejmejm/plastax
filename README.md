@@ -1,4 +1,4 @@
-# dynamic_net — Dynamic Neural Network Framework
+# plastax — Dynamic Neural Network Framework
 
 A JAX/Equinox framework for neural networks that change structure at every step. Each neuron has individual state, and the user defines transition rules for how the network computes, learns, and evolves. The framework simulates these rules.
 
