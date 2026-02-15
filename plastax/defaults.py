@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
-from dynamic_net.states import (
+from plastax.states import (
     BackwardPassState,
     ConnectivityState,
     ForwardPassState,

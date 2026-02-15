@@ -1,7 +1,7 @@
-"""Demo: Standard MLP with MSE + SGD on synthetic regression using the dynamic_net framework.
+"""Demo: Standard MLP with MSE + SGD on synthetic regression using the plastax framework.
 
 Task: y = [sin(x1 + x2), cos(x1 - x2)], 2 inputs, 2 outputs.
-Uses default forward/backward/update functions from dynamic_net.defaults.
+Uses default forward/backward/update functions from plastax.defaults.
 """
 
 import argparse
@@ -15,7 +15,7 @@ import mlflow
 import numpy as np
 from tqdm import tqdm
 
-from dynamic_net import (
+from plastax import (
     Network,
     StructureUpdateState,
     UserFunctions,

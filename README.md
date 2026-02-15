@@ -80,7 +80,7 @@ Each step of the framework runs:
 
 ## User-Defined Functions
 
-All functions are passed via `UserFunctions`. Default implementations are provided in `dynamic_net.defaults`.
+All functions are passed via `UserFunctions`. Default implementations are provided in `plastax.defaults`.
 
 ### `forward_fn(neuron_state, incoming_activations) -> (activation_value, updated_neuron_state)`
 
@@ -115,7 +115,7 @@ Initializes a newly generated neuron given its connectivity.
 Extend the base states by subclassing:
 
 ```python
-from dynamic_net import ForwardPassState
+from plastax import ForwardPassState
 
 class MyForwardPassState(ForwardPassState):
     pre_activation: Float[Array, '']
@@ -126,7 +126,7 @@ All neurons must share the same state structure (required for vmapping). Define 
 
 ## Default Implementations
 
-`dynamic_net.defaults` provides factory functions for standard backprop + SGD:
+`plastax.defaults` provides factory functions for standard backprop + SGD:
 
 - **`make_default_forward_fn(activation_fn)`** — Weighted sum + activation. Stores `pre_activation` and `incoming_activations` in `DefaultForwardPassState`.
 - **`make_default_backward_signal_fn()`** — Standard backprop: finds outgoing connections in the next layer and sums `weight * error_signal * mask`.

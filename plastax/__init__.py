@@ -1,4 +1,4 @@
-from dynamic_net.states import (
+from plastax.states import (
     BackwardPassState,
     ConnectivityState,
     ForwardPassState,
@@ -6,11 +6,11 @@ from dynamic_net.states import (
     StructureUpdateState,
     tree_replace,
 )
-from dynamic_net.network import (
+from plastax.network import (
     Network,
     UserFunctions,
 )
-from dynamic_net.defaults import (
+from plastax.defaults import (
     DefaultForwardPassState,
     default_structure_update_fn,
     make_default_backward_signal_fn,
