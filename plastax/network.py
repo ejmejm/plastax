@@ -153,24 +153,60 @@ class Network(eqx.Module):
     # Ops (public)
     # -----------------------------------------------------------------------
 
-    def add_unit(self, layer_idx: int, neuron_state: NeuronState) -> 'Network':
-        """Insert a neuron into the first inactive slot of the given hidden layer."""
-        start, end = self.layer_boundaries[layer_idx]
-        layer_active = self.hidden_states.active_mask[start:end]
+    def add_unit(
+        self, neuron_state: NeuronState, connect_to_output: bool = False,
+    ) -> Tuple['Network', Bool[Array, '']]:
+        """Insert a neuron into the correct hidden layer based on its incoming connections.
 
+        The target layer is determined automatically: if the neuron's active
+        incoming connections reference layer *k* (or the inputs), the neuron is
+        placed in layer *k+1* (or layer 0).
+
+        Returns the updated network and a boolean indicating success (False if
+        the target layer had no inactive slots).
+        """
+        # Determine target layer from active incoming connections
+        active_ids = jnp.where(
+            neuron_state.connectivity.active_connection_mask,
+            neuron_state.connectivity.incoming_ids, -1,
+        )
+        max_id = jnp.max(active_ids)
+
+        layer_idx = jnp.where(
+            max_id < self.n_inputs, 0,
+            (max_id - self.n_inputs) // self.max_hidden_per_layer + 1,
+        )
+        start = layer_idx * self.max_hidden_per_layer
+
+        # Find first inactive slot in the target layer
+        layer_active = jax.lax.dynamic_slice(
+            self.hidden_states.active_mask, (start,), (self.max_hidden_per_layer,),
+        )
         slot = jnp.argmin(layer_active)
         has_slot = ~layer_active[slot]
+        hidden_rel = start + slot
 
-        layer_states = self._get_layer_states(self.hidden_states, start, end)
-        updated_layer = jax.tree.map(
-            lambda full, single: jnp.where(has_slot, full.at[slot].set(single), full),
-            layer_states, neuron_state,
+        # Insert neuron at the slot
+        hidden_states = jax.tree.map(
+            lambda full, single: jnp.where(has_slot, full.at[hidden_rel].set(single), full),
+            self.hidden_states, neuron_state,
         )
-        hidden_states = self._set_layer_states(self.hidden_states, start, end, updated_layer)
-        return tree_replace(self, hidden_states=hidden_states)
+
+        output_states = self.output_states
+        if connect_to_output:
+            abs_index = hidden_rel + self.n_inputs
+            output_states = self._auto_connect_to_output(output_states, abs_index, has_slot)
+
+        return tree_replace(self, hidden_states=hidden_states, output_states=output_states), has_slot
 
     def remove_unit(self, neuron_abs_idx: Int[Array, '']) -> 'Network':
-        """Deactivate a hidden neuron and remove all connections to/from it."""
+        """Deactivate a hidden neuron and disconnect other neurons from it.
+
+        The neuron's own incoming connections are left as-is since the slot
+        will be fully overwritten if reused by add_unit or _generate_neurons.
+        Connections from other neurons TO this one must be cleaned up so they
+        don't accidentally attach to a future occupant of the same slot.
+        """
         hidden_states = self.hidden_states
         output_states = self.output_states
         hidden_rel = neuron_abs_idx - self.n_inputs
@@ -180,12 +216,6 @@ class Network(eqx.Module):
             lambda s: s.active_mask, hidden_states,
             hidden_states.active_mask.at[hidden_rel].set(False),
         )
-
-        # Deactivate its incoming connections
-        new_conn_mask = hidden_states.connectivity.active_connection_mask.at[hidden_rel].set(
-            jnp.zeros(self.max_connections, dtype=bool))
-        hidden_states = eqx.tree_at(
-            lambda s: s.connectivity.active_connection_mask, hidden_states, new_conn_mask)
 
         # Deactivate connections pointing to this neuron in hidden layers
         hidden_match = hidden_states.connectivity.incoming_ids == neuron_abs_idx
@@ -206,93 +236,53 @@ class Network(eqx.Module):
     def add_connection_to_hidden(
         self,
         from_idx: Int[Array, ''],
-        to_hidden_rel: Int[Array, ''],
+        to_idx: Int[Array, ''],
         weight: Float[Array, ''] = jnp.array(0.0),
-    ) -> 'Network':
-        """Add a connection to a hidden neuron (specified by hidden-relative index)."""
-        hidden_states = self.hidden_states
-        conn_mask = hidden_states.connectivity.active_connection_mask[to_hidden_rel]
-        slot = jnp.argmin(conn_mask)
-        has_slot = ~conn_mask[slot]
+    ) -> Tuple['Network', Bool[Array, '']]:
+        """Add a connection to a hidden neuron.
 
-        new_ids = jnp.where(
-            has_slot,
-            hidden_states.connectivity.incoming_ids.at[to_hidden_rel, slot].set(from_idx),
-            hidden_states.connectivity.incoming_ids,
-        )
-        new_weights = jnp.where(
-            has_slot,
-            hidden_states.connectivity.weights.at[to_hidden_rel, slot].set(weight),
-            hidden_states.connectivity.weights,
-        )
-        new_mask = jnp.where(
-            has_slot,
-            hidden_states.connectivity.active_connection_mask.at[to_hidden_rel, slot].set(True),
-            hidden_states.connectivity.active_connection_mask,
-        )
-
-        hidden_states = eqx.tree_at(
-            lambda s: (s.connectivity.incoming_ids, s.connectivity.weights,
-                       s.connectivity.active_connection_mask),
-            hidden_states, (new_ids, new_weights, new_mask),
-        )
-        return tree_replace(self, hidden_states=hidden_states)
+        Both indices are relative to the hidden state array.  Returns the
+        updated network and a boolean indicating success (False if the neuron
+        had no inactive connection slots).
+        """
+        hidden_states, success = self._add_connection(
+            self.hidden_states, to_idx, from_idx, weight)
+        return tree_replace(self, hidden_states=hidden_states), success
 
     def add_connection_to_output(
         self,
         from_idx: Int[Array, ''],
-        to_output_rel: Int[Array, ''],
+        to_idx: Int[Array, ''],
         weight: Float[Array, ''] = jnp.array(0.0),
-    ) -> 'Network':
-        """Add a connection to an output neuron (specified by output-relative index)."""
-        output_states = self.output_states
-        conn_mask = output_states.connectivity.active_connection_mask[to_output_rel]
-        slot = jnp.argmin(conn_mask)
-        has_slot = ~conn_mask[slot]
+    ) -> Tuple['Network', Bool[Array, '']]:
+        """Add a connection to an output neuron.
 
-        new_ids = jnp.where(
-            has_slot,
-            output_states.connectivity.incoming_ids.at[to_output_rel, slot].set(from_idx),
-            output_states.connectivity.incoming_ids,
-        )
-        new_weights = jnp.where(
-            has_slot,
-            output_states.connectivity.weights.at[to_output_rel, slot].set(weight),
-            output_states.connectivity.weights,
-        )
-        new_mask = jnp.where(
-            has_slot,
-            output_states.connectivity.active_connection_mask.at[to_output_rel, slot].set(True),
-            output_states.connectivity.active_connection_mask,
-        )
-
-        output_states = eqx.tree_at(
-            lambda s: (s.connectivity.incoming_ids, s.connectivity.weights,
-                       s.connectivity.active_connection_mask),
-            output_states, (new_ids, new_weights, new_mask),
-        )
-        return tree_replace(self, output_states=output_states)
+        Both indices are relative to the output state array.  Returns the
+        updated network and a boolean indicating success (False if the neuron
+        had no inactive connection slots).
+        """
+        output_states, success = self._add_connection(
+            self.output_states, to_idx, from_idx, weight)
+        return tree_replace(self, output_states=output_states), success
 
     def remove_connection_from_hidden(
-        self, hidden_rel: Int[Array, ''], connection_slot: int,
+        self, neuron_idx: Int[Array, ''], connection_slot: int,
     ) -> 'Network':
-        """Deactivate a connection at the given slot of a hidden neuron."""
-        hidden_states = eqx.tree_at(
-            lambda s: s.connectivity.active_connection_mask, self.hidden_states,
-            self.hidden_states.connectivity.active_connection_mask.at[
-                hidden_rel, connection_slot].set(False),
-        )
+        """Deactivate a connection at the given slot of a hidden neuron.
+
+        neuron_idx is relative to the hidden state array.
+        """
+        hidden_states = self._remove_connection(self.hidden_states, neuron_idx, connection_slot)
         return tree_replace(self, hidden_states=hidden_states)
 
     def remove_connection_from_output(
-        self, output_rel: Int[Array, ''], connection_slot: int,
+        self, neuron_idx: Int[Array, ''], connection_slot: int,
     ) -> 'Network':
-        """Deactivate a connection at the given slot of an output neuron."""
-        output_states = eqx.tree_at(
-            lambda s: s.connectivity.active_connection_mask, self.output_states,
-            self.output_states.connectivity.active_connection_mask.at[
-                output_rel, connection_slot].set(False),
-        )
+        """Deactivate a connection at the given slot of an output neuron.
+
+        neuron_idx is relative to the output state array.
+        """
+        output_states = self._remove_connection(self.output_states, neuron_idx, connection_slot)
         return tree_replace(self, output_states=output_states)
 
     # -----------------------------------------------------------------------
@@ -492,6 +482,46 @@ class Network(eqx.Module):
     # -----------------------------------------------------------------------
 
     @staticmethod
+    def _add_connection(
+        neuron_states: NeuronState,
+        to_idx: Int[Array, ''],
+        from_idx: Int[Array, ''],
+        weight: Float[Array, ''],
+    ) -> Tuple[NeuronState, Bool[Array, '']]:
+        """Add a connection to a neuron in the given state array.
+
+        Returns the updated states and a boolean indicating success.
+        """
+        connectivity = neuron_states.connectivity
+        conn_mask = connectivity.active_connection_mask[to_idx]
+        slot = jnp.argmin(conn_mask)
+        has_slot = ~conn_mask[slot]
+
+        updated = ConnectivityState(
+            incoming_ids=connectivity.incoming_ids.at[to_idx, slot].set(from_idx),
+            weights=connectivity.weights.at[to_idx, slot].set(weight),
+            active_connection_mask=connectivity.active_connection_mask.at[to_idx, slot].set(True),
+        )
+        new_connectivity = jax.tree.map(
+            lambda u, o: jnp.where(has_slot, u, o),
+            updated, connectivity,
+        )
+        return eqx.tree_at(lambda s: s.connectivity, neuron_states, new_connectivity), has_slot
+
+    @staticmethod
+    def _remove_connection(
+        neuron_states: NeuronState,
+        neuron_idx: Int[Array, ''],
+        connection_slot: int,
+    ) -> NeuronState:
+        """Deactivate a connection at the given slot of a neuron."""
+        return eqx.tree_at(
+            lambda s: s.connectivity.active_connection_mask, neuron_states,
+            neuron_states.connectivity.active_connection_mask.at[
+                neuron_idx, connection_slot].set(False),
+        )
+
+    @staticmethod
     def _get_layer_states(neuron_states: NeuronState, start: int, end: int) -> NeuronState:
         return jax.tree.map(lambda x: x[start:end], neuron_states)
 
@@ -522,15 +552,7 @@ class Network(eqx.Module):
             hidden_states.active_mask.at[start:end].set(new_active),
         )
 
-        # Deactivate pruned neurons' own incoming connections
-        pruned_conn_mask = hidden_states.connectivity.active_connection_mask[start:end]
-        pruned_conn_mask = jnp.where(prune_mask[:, None], False, pruned_conn_mask)
-        hidden_states = eqx.tree_at(
-            lambda s: s.connectivity.active_connection_mask, hidden_states,
-            hidden_states.connectivity.active_connection_mask.at[start:end].set(pruned_conn_mask),
-        )
-
-        # Deactivate connections in other layers that point to pruned neurons
+        # Deactivate connections in other neurons that point to pruned neurons
         abs_indices = jnp.arange(start, end) + n_inputs
         pruned_abs = jnp.where(prune_mask, abs_indices, -1)
 

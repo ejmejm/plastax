@@ -197,3 +197,6 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 # With MLflow logging
 python demo.py --seed 42 --num_steps 50000 --mlflow
 ```
+
+### TODO
+- [ ] Continue allowing users to make individual structural changes, but put them in a buffer until `step` or a new `apply_structure_changes` function is called so that they can be parallelized.
