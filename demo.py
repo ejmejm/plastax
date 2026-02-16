@@ -17,8 +17,8 @@ from tqdm import tqdm
 
 from plastax import (
     Network,
+    StateUpdateFunctions,
     StructureUpdateState,
-    UserFunctions,
     default_structure_update_fn,
     make_default_backward_signal_fn,
     make_default_forward_fn,
@@ -57,11 +57,9 @@ class DemoStructureUpdateState(StructureUpdateState):
 class TrainState(eqx.Module):
     # Static
     log_interval: int = eqx.field(static=True)
-    user_fns: UserFunctions = eqx.field(static=True)
 
     # Dynamic
     network: Network
-    structure_state: DemoStructureUpdateState
     rng: jax.Array
     step: jax.Array
 
@@ -90,8 +88,24 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     hidden_template = make_default_neuron_state(max_connections)
     output_template = make_default_output_neuron_state(max_output_connections)
 
-    key, net_key = random.split(key)
-    network = Network.create(
+    # Build state update functions
+    lr = args.learning_rate
+    identity = lambda x: x
+
+    state_update_fns = StateUpdateFunctions(
+        forward_fn=make_default_forward_fn(jax.nn.relu),
+        backward_signal_fn=make_default_backward_signal_fn(),
+        neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
+        structure_update_fn=default_structure_update_fn,
+        init_neuron_fn=make_default_init_neuron_fn(max_connections),
+        compute_output_error_fn=make_default_output_error_fn(),
+        output_forward_fn=make_default_forward_fn(identity),
+        output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
+    )
+
+    structure_state = DemoStructureUpdateState(dummy=jnp.array(0))
+
+    network = Network(
         n_inputs=n_inputs,
         n_outputs=n_outputs,
         max_hidden_per_layer=hidden_dim,
@@ -102,7 +116,8 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         auto_connect_to_output=False,
         hidden_neuron_template=hidden_template,
         output_neuron_template=output_template,
-        key=net_key,
+        state_update_fns=state_update_fns,
+        structure_state=structure_state,
     )
 
     # Activate all hidden neurons and connect them to inputs
@@ -175,28 +190,9 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         output_weights,
     )
 
-    # Build user functions
-    lr = args.learning_rate
-    identity = lambda x: x
-
-    user_fns = UserFunctions(
-        forward_fn=make_default_forward_fn(jax.nn.relu),
-        backward_signal_fn=make_default_backward_signal_fn(),
-        neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
-        structure_update_fn=default_structure_update_fn,
-        init_neuron_fn=make_default_init_neuron_fn(max_connections),
-        compute_output_error_fn=make_default_output_error_fn(),
-        output_forward_fn=make_default_forward_fn(identity),
-        output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
-    )
-
-    structure_state = DemoStructureUpdateState(dummy=jnp.array(0))
-
     return TrainState(
         log_interval=args.log_interval,
-        user_fns=user_fns,
         network=network,
-        structure_state=structure_state,
         rng=key,
         step=jnp.array(0),
     )
@@ -216,9 +212,7 @@ def train_step(train_state: TrainState, _) -> Tuple[TrainState, StepMetrics]:
     y = jnp.array([jnp.sin(x1 + x2), jnp.cos(x1 - x2)])
 
     # Run framework step
-    network, structure_state = train_state.network.step(
-        x, y, train_state.structure_state, train_state.user_fns, step_key,
-    )
+    network = train_state.network.step(x, y, step_key)
 
     # Compute loss for logging
     output_activations = network.output_states.forward_state.activation_value
@@ -226,9 +220,7 @@ def train_step(train_state: TrainState, _) -> Tuple[TrainState, StepMetrics]:
 
     new_state = TrainState(
         log_interval=train_state.log_interval,
-        user_fns=train_state.user_fns,
         network=network,
-        structure_state=structure_state,
         rng=key,
         step=train_state.step + 1,
     )
@@ -306,8 +298,8 @@ def main():
             train_state.network,
             x,
         )
-        eval_net = eval_net._forward_pass(train_state.user_fns.forward_fn,
-                                          train_state.user_fns.output_forward_fn)
+        fns = eval_net.state_update_fns
+        eval_net = eval_net._forward_pass(fns.forward_fn, fns.output_forward_fn)
         pred = eval_net.output_states.forward_state.activation_value
         test_losses.append(float(jnp.mean((pred - y) ** 2)))
 

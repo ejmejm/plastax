@@ -15,10 +15,10 @@ from plastax.states import (
 
 
 # ---------------------------------------------------------------------------
-# User function container
+# State update function container
 # ---------------------------------------------------------------------------
 
-class UserFunctions(eqx.Module):
+class StateUpdateFunctions(eqx.Module):
     forward_fn: Callable = eqx.field(static=True)
     backward_signal_fn: Callable = eqx.field(static=True)
     neuron_update_fn: Callable = eqx.field(static=True)
@@ -46,11 +46,13 @@ class Network(eqx.Module):
     layer_boundaries: tuple = eqx.field(static=True)
     total_hidden: int = eqx.field(static=True)
     total_neurons: int = eqx.field(static=True)
+    state_update_fns: StateUpdateFunctions = eqx.field(static=True)
 
     # Dynamic (state)
     input_activations: Float[Array, 'n_inputs']
     hidden_states: NeuronState
     output_states: NeuronState
+    structure_state: StructureUpdateState
 
     def __init__(
         self,
@@ -61,12 +63,19 @@ class Network(eqx.Module):
         max_layers: int,
         max_connections: int,
         max_output_connections: int,
+        hidden_neuron_template: NeuronState,
+        output_neuron_template: NeuronState,
+        state_update_fns: StateUpdateFunctions,
+        structure_state: StructureUpdateState,
         max_generate_per_step: int = 0,
         auto_connect_to_output: bool = False,
-        input_activations: Float[Array, 'n_inputs'],
-        hidden_states: NeuronState,
-        output_states: NeuronState,
     ):
+        """Create a Network with inputs directly connected to outputs, all hidden inactive.
+
+        Takes single-neuron templates and broadcasts them to create the full
+        state arrays.  Output neurons are activated and wired to receive from
+        all input units.
+        """
         self.n_inputs = n_inputs
         self.n_outputs = n_outputs
         self.max_hidden_per_layer = max_hidden_per_layer
@@ -75,6 +84,7 @@ class Network(eqx.Module):
         self.max_output_connections = max_output_connections
         self.max_generate_per_step = max_generate_per_step
         self.auto_connect_to_output = auto_connect_to_output
+        self.state_update_fns = state_update_fns
 
         total_hidden = max_hidden_per_layer * max_layers
         self.total_hidden = total_hidden
@@ -84,33 +94,10 @@ class Network(eqx.Module):
             for k in range(max_layers)
         )
 
-        self.input_activations = input_activations
-        self.hidden_states = hidden_states
-        self.output_states = output_states
+        # Input activations default to zeros
+        self.input_activations = jnp.zeros(n_inputs)
 
-    # -----------------------------------------------------------------------
-    # Factory
-    # -----------------------------------------------------------------------
-
-    @classmethod
-    def create(
-        cls,
-        *,
-        n_inputs: int,
-        n_outputs: int,
-        max_hidden_per_layer: int,
-        max_layers: int,
-        max_connections: int,
-        max_output_connections: int,
-        hidden_neuron_template: NeuronState,
-        output_neuron_template: NeuronState,
-        key: PRNGKeyArray,
-        max_generate_per_step: int = 0,
-        auto_connect_to_output: bool = False,
-    ) -> 'Network':
-        """Create a Network with inputs directly connected to outputs, all hidden inactive."""
-        total_hidden = max_hidden_per_layer * max_layers
-
+        # Broadcast single-neuron templates to full state arrays
         hidden_states = jax.tree.map(
             lambda x: jnp.broadcast_to(x, (total_hidden,) + x.shape).copy(),
             hidden_neuron_template,
@@ -139,19 +126,9 @@ class Network(eqx.Module):
         output_states = eqx.tree_at(
             lambda s: s.connectivity.active_connection_mask, output_states, output_conn_mask)
 
-        return cls(
-            n_inputs=n_inputs,
-            n_outputs=n_outputs,
-            max_hidden_per_layer=max_hidden_per_layer,
-            max_layers=max_layers,
-            max_connections=max_connections,
-            max_output_connections=max_output_connections,
-            max_generate_per_step=max_generate_per_step,
-            auto_connect_to_output=auto_connect_to_output,
-            input_activations=jnp.zeros(n_inputs),
-            hidden_states=hidden_states,
-            output_states=output_states,
-        )
+        self.hidden_states = hidden_states
+        self.output_states = output_states
+        self.structure_state = structure_state
 
     # -----------------------------------------------------------------------
     # Public API
@@ -161,18 +138,16 @@ class Network(eqx.Module):
         self,
         inputs: Float[Array, 'n_inputs'],
         targets: Float[Array, 'n_outputs'],
-        structure_state: StructureUpdateState,
-        user_fns: UserFunctions,
         key: PRNGKeyArray,
-    ) -> Tuple['Network', StructureUpdateState]:
+    ) -> 'Network':
         """Run one full step: forward -> backward -> structure update -> generation."""
+        fns = self.state_update_fns
         network = tree_replace(self, input_activations=inputs)
-        network = network._forward_pass(user_fns.forward_fn, user_fns.output_forward_fn)
-        network = network._backward_pass(targets, user_fns)
-        network, structure_state, generation_specs = network._structure_update(
-            structure_state, user_fns.structure_update_fn)
-        network = network._generate_neurons(generation_specs, user_fns.init_neuron_fn, key)
-        return network, structure_state
+        network = network._forward_pass(fns.forward_fn, fns.output_forward_fn)
+        network = network._backward_pass(targets, fns)
+        network, generation_specs = network._structure_update(fns.structure_update_fn)
+        network = network._generate_neurons(generation_specs, fns.init_neuron_fn, key)
+        return network
 
     # -----------------------------------------------------------------------
     # Ops (public)
@@ -359,7 +334,7 @@ class Network(eqx.Module):
         return tree_replace(self, hidden_states=hidden_states, output_states=updated_output_states)
 
     def _backward_pass(
-        self, targets: Float[Array, 'n_outputs'], user_fns: UserFunctions,
+        self, targets: Float[Array, 'n_outputs'], user_fns: StateUpdateFunctions,
     ) -> 'Network':
         """Run backward pass: output error -> backward signal -> neuron update, layer by layer."""
         hidden_states = self.hidden_states
@@ -417,12 +392,12 @@ class Network(eqx.Module):
 
     def _structure_update(
         self,
-        structure_state: StructureUpdateState,
         structure_update_fn: Callable,
-    ) -> Tuple['Network', StructureUpdateState, list]:
+    ) -> Tuple['Network', list]:
         """Run structure update for each hidden layer (last to first)."""
         hidden_states = self.hidden_states
         output_states = self.output_states
+        structure_state = self.structure_state
         generation_specs = []
 
         for layer_k in range(self.max_layers - 1, -1, -1):
@@ -443,8 +418,9 @@ class Network(eqx.Module):
 
             generation_specs.append((layer_k, n_generate))
 
-        updated = tree_replace(self, hidden_states=hidden_states, output_states=output_states)
-        return updated, structure_state, generation_specs
+        updated = tree_replace(self, hidden_states=hidden_states, output_states=output_states,
+                               structure_state=structure_state)
+        return updated, generation_specs
 
     def _generate_neurons(
         self,

@@ -8,7 +8,7 @@ from plastax.states import (
 )
 from plastax.network import (
     Network,
-    UserFunctions,
+    StateUpdateFunctions,
 )
 from plastax.defaults import (
     DefaultForwardPassState,
