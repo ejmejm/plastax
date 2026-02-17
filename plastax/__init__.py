@@ -1,7 +1,4 @@
 from plastax.states import (
-    BackwardPassState,
-    ConnectivityState,
-    ForwardPassState,
     NeuronState,
     StructureUpdateState,
     tree_replace,
@@ -11,7 +8,6 @@ from plastax.network import (
     StateUpdateFunctions,
 )
 from plastax.defaults import (
-    DefaultForwardPassState,
     DefaultNeuronState,
     default_structure_update_fn,
     make_default_backward_signal_fn,

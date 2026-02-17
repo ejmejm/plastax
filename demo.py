@@ -158,12 +158,12 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
             active_conn_mask = active_conn_mask.at[start:end, :hidden_dim].set(True)
 
     network = eqx.tree_at(
-        lambda s: s.hidden_states.connectivity.incoming_ids,
+        lambda s: s.hidden_states.incoming_ids,
         network,
         incoming_ids,
     )
     network = eqx.tree_at(
-        lambda s: s.hidden_states.connectivity.active_connection_mask,
+        lambda s: s.hidden_states.active_connection_mask,
         network,
         active_conn_mask,
     )
@@ -182,12 +182,12 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     output_conn_mask = output_conn_mask.at[:, :hidden_dim].set(True)
 
     network = eqx.tree_at(
-        lambda s: s.output_states.connectivity.incoming_ids,
+        lambda s: s.output_states.incoming_ids,
         network,
         output_incoming_ids,
     )
     network = eqx.tree_at(
-        lambda s: s.output_states.connectivity.active_connection_mask,
+        lambda s: s.output_states.active_connection_mask,
         network,
         output_conn_mask,
     )
@@ -214,12 +214,12 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         random.normal(w_output_key, (n_outputs, hidden_dim)) * output_weight_scale)
 
     network = eqx.tree_at(
-        lambda s: s.hidden_states.connectivity.weights,
+        lambda s: s.hidden_states.weights,
         network,
         hidden_weights,
     )
     network = eqx.tree_at(
-        lambda s: s.output_states.connectivity.weights,
+        lambda s: s.output_states.weights,
         network,
         output_weights,
     )
@@ -249,7 +249,7 @@ def train_step(train_state: TrainState, _) -> Tuple[TrainState, StepMetrics]:
     network = train_state.network.step(x, y, step_key)
 
     # Compute loss for logging
-    output_activations = network.output_states.forward_state.activation_value
+    output_activations = network.output_states.activation_value
     loss = jnp.mean((output_activations - y) ** 2)
 
     new_state = TrainState(
@@ -333,7 +333,7 @@ def main():
             x,
         )
         eval_net = eval_net._forward_pass()
-        pred = eval_net.output_states.forward_state.activation_value
+        pred = eval_net.output_states.activation_value
         test_losses.append(float(jnp.mean((pred - y) ** 2)))
 
     avg_test_loss = float(np.mean(test_losses))

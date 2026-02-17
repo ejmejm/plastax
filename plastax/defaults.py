@@ -1,17 +1,12 @@
 """Default implementations of user-defined functions for standard backprop + SGD."""
 
-from functools import partial
 from typing import Callable, Tuple
 
-import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
 from plastax.states import (
-    BackwardPassState,
-    ConnectivityState,
-    ForwardPassState,
     NeuronState,
     StructureUpdateState,
     tree_replace,
@@ -19,28 +14,18 @@ from plastax.states import (
 
 
 # ---------------------------------------------------------------------------
-# Default forward pass state (extends base with fields needed for backprop)
-# ---------------------------------------------------------------------------
-
-class DefaultForwardPassState(ForwardPassState):
-    pre_activation: Float[Array, '']
-    incoming_activations: Float[Array, 'max_connections']
-
-    def __init__(self, max_connections: int):
-        super().__init__()
-        self.pre_activation = jnp.array(0.0)
-        self.incoming_activations = jnp.zeros(max_connections)
-
-
-# ---------------------------------------------------------------------------
 # Default NeuronState class
 # ---------------------------------------------------------------------------
 
 class DefaultNeuronState(NeuronState):
-    """NeuronState using DefaultForwardPassState for standard backprop."""
+    """NeuronState with extra fields for standard backprop."""
+    pre_activation: Float[Array, '']
+    incoming_activations: Float[Array, 'max_connections']
 
     def __init__(self, max_connections: int):
-        super().__init__(max_connections, forward_state=DefaultForwardPassState(max_connections))
+        super().__init__(max_connections)
+        self.pre_activation = jnp.array(0.0)
+        self.incoming_activations = jnp.zeros(max_connections)
 
 
 # ---------------------------------------------------------------------------
@@ -50,24 +35,23 @@ class DefaultNeuronState(NeuronState):
 def make_default_forward_fn(activation_fn: Callable = jax.nn.relu) -> Callable:
     """Create a forward function that does weighted sum + activation.
 
-    Stores pre_activation and incoming_activations in DefaultForwardPassState.
+    Stores pre_activation and incoming_activations in DefaultNeuronState.
     """
     def forward_fn(
         neuron_state: NeuronState,
         incoming_activations: Float[Array, 'max_connections'],
     ) -> Tuple[Float[Array, ''], NeuronState]:
-        weights = neuron_state.connectivity.weights
-        mask = neuron_state.connectivity.active_connection_mask
+        weights = neuron_state.weights
+        mask = neuron_state.active_connection_mask
         pre_activation = (incoming_activations * weights * mask).sum()
         activation_value = activation_fn(pre_activation)
 
-        updated_forward = tree_replace(
-            neuron_state.forward_state,
+        updated_state = tree_replace(
+            neuron_state,
             activation_value=activation_value,
             pre_activation=pre_activation,
             incoming_activations=incoming_activations * mask,
         )
-        updated_state = tree_replace(neuron_state, forward_state=updated_forward)
         return activation_value, updated_state
 
     return forward_fn
@@ -87,24 +71,23 @@ def make_default_backward_signal_fn() -> Callable:
         neuron_state: NeuronState,
         neuron_index: Int[Array, ''],
         next_layer_states: NeuronState,
-    ) -> BackwardPassState:
-        # next_layer_states.connectivity.incoming_ids: (next_layer_size, max_conn)
-        next_incoming = next_layer_states.connectivity.incoming_ids
-        next_weights = next_layer_states.connectivity.weights
-        next_conn_mask = next_layer_states.connectivity.active_connection_mask
-        next_errors = next_layer_states.backward_state.error_signal  # (next_layer_size,)
-        next_active = next_layer_states.active_mask  # (next_layer_size,)
+    ) -> Float[Array, '']:
+        next_incoming = next_layer_states.incoming_ids
+        next_weights = next_layer_states.weights
+        next_conn_mask = next_layer_states.active_connection_mask
+        next_errors = next_layer_states.error_signal
+        next_active = next_layer_states.active_mask
 
         # Find where this neuron's index appears in next layer's incoming connections
-        is_match = (next_incoming == neuron_index) & next_conn_mask  # (next_layer_size, max_conn)
+        is_match = (next_incoming == neuron_index) & next_conn_mask
 
         # For each next-layer neuron, sum the weights of connections from this neuron
-        effective_weights = (next_weights * is_match).sum(axis=-1)  # (next_layer_size,)
+        effective_weights = (next_weights * is_match).sum(axis=-1)
 
         # Weight by the next-layer neurons' error signals and active mask
         error_from_above = (effective_weights * next_errors * next_active).sum()
 
-        return tree_replace(neuron_state.backward_state, error_signal=error_from_above)
+        return error_from_above
 
     return backward_signal_fn
 
@@ -126,26 +109,23 @@ def make_default_neuron_update_fn(
     activation_deriv = jax.grad(activation_fn)
 
     def neuron_update_fn(neuron_state: NeuronState) -> NeuronState:
-        error_signal = neuron_state.backward_state.error_signal
-        pre_activation = neuron_state.forward_state.pre_activation
-        incoming_activations = neuron_state.forward_state.incoming_activations
+        error_signal = neuron_state.error_signal
+        pre_activation = neuron_state.pre_activation
+        incoming_activations = neuron_state.incoming_activations
 
         # Activation derivative at pre_activation
         act_deriv = activation_deriv(pre_activation)
         delta = error_signal * act_deriv
 
         # Weight update: w -= lr * delta * incoming_activation
-        conn_mask = neuron_state.connectivity.active_connection_mask
+        conn_mask = neuron_state.active_connection_mask
         weight_grads = delta * incoming_activations * conn_mask
-        new_weights = neuron_state.connectivity.weights - learning_rate * weight_grads
-
-        updated_connectivity = tree_replace(neuron_state.connectivity, weights=new_weights)
-        updated_backward = tree_replace(neuron_state.backward_state, error_signal=delta)
+        new_weights = neuron_state.weights - learning_rate * weight_grads
 
         return tree_replace(
             neuron_state,
-            connectivity=updated_connectivity,
-            backward_state=updated_backward,
+            weights=new_weights,
+            error_signal=delta,
         )
 
     return neuron_update_fn
@@ -184,7 +164,7 @@ def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
         key: jax.Array,
     ) -> NeuronState:
         state = neuron_cls()
-        max_conn = state.connectivity.weights.shape[0]
+        max_conn = state.weights.shape[0]
         n_total = connectable_mask.shape[0]
 
         # Shuffle indices, then sort connectable ones to the front
@@ -194,13 +174,13 @@ def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
         selected = shuffled[jnp.argsort(sort_keys)[:max_conn]]
         is_connected = connectable_mask[selected]
 
-        connectivity = tree_replace(
-            state.connectivity,
+        return tree_replace(
+            state,
+            active_mask=jnp.array(True),
             incoming_ids=jnp.where(is_connected, selected, 0),
             weights=jnp.zeros(max_conn),
             active_connection_mask=is_connected,
         )
-        return tree_replace(state, active_mask=jnp.array(True), connectivity=connectivity)
     return init_neuron_fn
 
 
