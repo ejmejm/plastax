@@ -300,8 +300,7 @@ def main():
             train_state.network,
             x,
         )
-        fns = eval_net.state_update_fns
-        eval_net = eval_net._forward_pass(fns.forward_fn, fns.output_forward_fn)
+        eval_net = eval_net._forward_pass()
         pred = eval_net.output_states.forward_state.activation_value
         test_losses.append(float(jnp.mean((pred - y) ** 2)))
 

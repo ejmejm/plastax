@@ -141,12 +141,11 @@ class Network(eqx.Module):
         key: PRNGKeyArray,
     ) -> 'Network':
         """Run one full step: forward -> backward -> structure update -> generation."""
-        fns = self.state_update_fns
         network = tree_replace(self, input_values=inputs)
-        network = network._forward_pass(fns.forward_fn, fns.output_forward_fn)
-        network = network._backward_pass(targets, fns)
-        network, generation_specs = network._structure_update(fns.structure_update_fn)
-        network = network._generate_neurons(generation_specs, fns.init_neuron_fn, key)
+        network = network._forward_pass()
+        network = network._backward_pass(targets)
+        network, generation_specs = network._structure_update()
+        network = network._generate_neurons(generation_specs, key)
         return network
 
     # -----------------------------------------------------------------------
@@ -180,8 +179,7 @@ class Network(eqx.Module):
 
         # Find first inactive slot in the target layer
         layer_active = jax.lax.dynamic_slice(
-            self.hidden_states.active_mask, (start,), (self.max_hidden_per_layer,),
-        )
+            self.hidden_states.active_mask, (start,), (self.max_hidden_per_layer,))
         slot = jnp.argmin(layer_active)
         has_slot = ~layer_active[slot]
         hidden_rel = start + slot
@@ -296,10 +294,9 @@ class Network(eqx.Module):
             self.output_states.forward_state.activation_value,
         ])
 
-    def _forward_pass(
-        self, forward_fn: Callable, output_forward_fn: Callable | None = None,
-    ) -> 'Network':
+    def _forward_pass(self) -> 'Network':
         """Run forward pass layer by layer (global mode)."""
+        fns = self.state_update_fns
         hidden_states = self.hidden_states
         all_activations = self._build_all_activations()
 
@@ -308,7 +305,7 @@ class Network(eqx.Module):
             layer_states = self._get_layer_states(hidden_states, start, end)
 
             incoming_acts = all_activations[layer_states.connectivity.incoming_ids]
-            new_activations, updated_states = jax.vmap(forward_fn)(layer_states, incoming_acts)
+            new_activations, updated_states = jax.vmap(fns.forward_fn)(layer_states, incoming_acts)
             new_activations = new_activations * layer_states.active_mask
 
             hidden_states = self._set_layer_states(hidden_states, start, end, updated_states)
@@ -316,74 +313,64 @@ class Network(eqx.Module):
             abs_end = self.n_inputs + end
             all_activations = all_activations.at[abs_start:abs_end].set(new_activations)
 
-        output_states = self.output_states
-        output_incoming_acts = all_activations[output_states.connectivity.incoming_ids]
-        out_fn = output_forward_fn if output_forward_fn is not None else forward_fn
-        _, updated_output_states = jax.vmap(out_fn)(output_states, output_incoming_acts)
+        output_incoming_acts = all_activations[self.output_states.connectivity.incoming_ids]
+        out_fn = fns.output_forward_fn if fns.output_forward_fn is not None else fns.forward_fn
+        _, updated_output_states = jax.vmap(out_fn)(self.output_states, output_incoming_acts)
 
         return tree_replace(self, hidden_states=hidden_states, output_states=updated_output_states)
 
-    def _backward_pass(
-        self, targets: Float[Array, 'n_outputs'], user_fns: StateUpdateFunctions,
-    ) -> 'Network':
+    def _backward_pass(self, targets: Float[Array, 'n_outputs']) -> 'Network':
         """Run backward pass: output error -> backward signal -> neuron update, layer by layer."""
+        fns = self.state_update_fns
         hidden_states = self.hidden_states
         output_states = self.output_states
 
         # 1. Compute output error
         output_activations = output_states.forward_state.activation_value
-        output_error = user_fns.compute_output_error_fn(output_activations, targets)
+        output_error = fns.compute_output_error_fn(output_activations, targets)
         output_states = eqx.tree_at(
-            lambda s: s.backward_state.error_signal, output_states, output_error)
+            lambda s: s.backward_state.error_signal,
+            output_states,
+            output_error,
+        )
 
-        # 2. Save output pre-update weights, then run neuron update
-        output_pre_update_weights = output_states.connectivity.weights
-        out_update_fn = (user_fns.output_neuron_update_fn
-                         if user_fns.output_neuron_update_fn is not None
-                         else user_fns.neuron_update_fn)
-        output_states = jax.vmap(out_update_fn)(output_states)
+        # 2. Top-down: propagate signals from each layer, then update its weights
+        out_update_fn = (fns.output_neuron_update_fn
+                         if fns.output_neuron_update_fn is not None
+                         else fns.neuron_update_fn)
 
-        # 3. Hidden layers from last to first
-        for layer_k in range(self.max_layers - 1, -1, -1):
-            start, end = self.layer_boundaries[layer_k]
-            layer_states = self._get_layer_states(hidden_states, start, end)
-            layer_indices = jnp.arange(start, end) + self.n_inputs
-
-            # Next layer states with PRE-update weights
-            if layer_k == self.max_layers - 1:
-                next_layer_states = eqx.tree_at(
-                    lambda s: s.connectivity.weights,
-                    output_states, output_pre_update_weights,
-                )
+        for layer_k in range(self.max_layers, -1, -1):
+            # Get this layer's states
+            if layer_k == self.max_layers:
+                current_states = output_states
             else:
-                next_start, next_end = self.layer_boundaries[layer_k + 1]
-                next_layer_states = self._get_layer_states(hidden_states, next_start, next_end)
-                next_layer_states = eqx.tree_at(
-                    lambda s: s.connectivity.weights,
-                    next_layer_states, hidden_pre_update_weights,
-                )
+                start, end = self.layer_boundaries[layer_k]
+                current_states = self._get_layer_states(hidden_states, start, end)
 
-            # Propagate signals backward
-            updated_backward = jax.vmap(
-                user_fns.backward_signal_fn, in_axes=(0, 0, None)
-            )(layer_states, layer_indices, next_layer_states)
+            # Propagate signals to the layer below (if one exists)
+            if layer_k > 0:
+                below_start, below_end = self.layer_boundaries[layer_k - 1]
+                below_states = self._get_layer_states(hidden_states, below_start, below_end)
+                below_indices = jnp.arange(below_start, below_end) + self.n_inputs
+                updated_backward = jax.vmap(
+                    fns.backward_signal_fn, in_axes=(0, 0, None)
+                )(below_states, below_indices, current_states)
+                below_states = eqx.tree_at(
+                    lambda s: s.backward_state, below_states, updated_backward)
+                hidden_states = self._set_layer_states(
+                    hidden_states, below_start, below_end, below_states)
 
-            layer_states = eqx.tree_at(
-                lambda s: s.backward_state, layer_states, updated_backward)
-
-            # Save pre-update weights for this layer
-            hidden_pre_update_weights = layer_states.connectivity.weights
-
-            # Run neuron update
-            layer_states = jax.vmap(user_fns.neuron_update_fn)(layer_states)
-            hidden_states = self._set_layer_states(hidden_states, start, end, layer_states)
+            # Update this layer's weights
+            if layer_k == self.max_layers:
+                output_states = jax.vmap(out_update_fn)(output_states)
+            else:
+                current_states = self._get_layer_states(hidden_states, start, end)
+                current_states = jax.vmap(fns.neuron_update_fn)(current_states)
+                hidden_states = self._set_layer_states(hidden_states, start, end, current_states)
 
         return tree_replace(self, hidden_states=hidden_states, output_states=output_states)
 
-    def _structure_update(
-        self,
-        structure_update_fn: Callable,
-    ) -> Tuple['Network', list]:
+    def _structure_update(self) -> Tuple['Network', list]:
         """Run structure update for each hidden layer (last to first)."""
         hidden_states = self.hidden_states
         output_states = self.output_states
@@ -400,7 +387,7 @@ class Network(eqx.Module):
                 next_start, next_end = self.layer_boundaries[layer_k + 1]
                 next_layer_states = self._get_layer_states(hidden_states, next_start, next_end)
 
-            structure_state, prune_mask, n_generate = structure_update_fn(
+            structure_state, prune_mask, n_generate = self.state_update_fns.structure_update_fn(
                 layer_states, next_layer_states, structure_state)
 
             hidden_states, output_states = self._apply_pruning(
@@ -415,7 +402,6 @@ class Network(eqx.Module):
     def _generate_neurons(
         self,
         generation_specs: list,
-        init_neuron_fn: Callable,
         key: PRNGKeyArray,
     ) -> 'Network':
         """Generate new neurons as specified by the structure update."""
@@ -461,7 +447,7 @@ class Network(eqx.Module):
                 )
 
                 abs_index = start + slot + self.n_inputs
-                new_neuron = init_neuron_fn(connectivity, abs_index, unit_key)
+                new_neuron = self.state_update_fns.init_neuron_fn(connectivity, abs_index, unit_key)
 
                 new_neuron_active = tree_replace(new_neuron, active_mask=jnp.array(True))
                 layer_states = self._get_layer_states(hidden_states, start, end)
