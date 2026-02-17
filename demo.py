@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--seed', type=int, default=None)
     parser.add_argument('--learning_rate', type=float, default=0.01)
     parser.add_argument('--hidden_dim', type=int, default=32)
+    parser.add_argument('--num_layers', type=int, default=1)
     parser.add_argument('--num_steps', type=int, default=50_000)
     parser.add_argument('--log_interval', type=int, default=500)
     parser.add_argument('--mlflow', action='store_true')
@@ -80,11 +81,14 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     n_inputs = 2
     n_outputs = 2
     hidden_dim = args.hidden_dim
+    num_layers = args.num_layers
+    # Layer 0 connects to inputs; deeper layers connect to prior hidden layer.
+    max_hidden_conn = max(n_inputs, hidden_dim)
 
     # Define neuron classes with baked-in max_connections
     class HiddenNeuron(DefaultNeuronState):
         def __init__(self):
-            super().__init__(max_connections=n_inputs)
+            super().__init__(max_connections=max_hidden_conn)
 
     class OutputNeuron(DefaultNeuronState):
         def __init__(self):
@@ -111,7 +115,7 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         n_inputs=n_inputs,
         n_outputs=n_outputs,
         max_hidden_per_layer=hidden_dim,
-        max_layers=1,
+        max_layers=args.num_layers,
         max_generate_per_step=0,
         auto_connect_to_output=False,
         hidden_neuron_cls=HiddenNeuron,
@@ -120,7 +124,7 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         structure_state=structure_state,
     )
 
-    # Activate all hidden neurons and connect them to inputs
+    # Activate all hidden neurons
     hidden_active = jnp.ones(network.total_hidden, dtype=bool)
     network = eqx.tree_at(
         lambda s: s.hidden_states.active_mask,
@@ -128,35 +132,52 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         hidden_active,
     )
 
-    # Set hidden neurons' incoming connections to the 2 input neurons
+    # Connect each hidden layer to the prior layer (layer 0 -> inputs, layer k -> layer k-1)
     max_conn = network.max_connections
-    input_ids = jnp.broadcast_to(
-        jnp.arange(n_inputs, dtype=jnp.int32),
-        (network.total_hidden, max_conn),
-    )
-    input_conn_mask = jnp.ones((network.total_hidden, max_conn), dtype=bool)
+    total_hidden = network.total_hidden
+    incoming_ids = jnp.zeros((total_hidden, max_conn), dtype=jnp.int32)
+    active_conn_mask = jnp.zeros((total_hidden, max_conn), dtype=bool)
+
+    for k in range(num_layers):
+        start = k * hidden_dim
+        end = (k + 1) * hidden_dim
+        if k == 0:
+            ids = jnp.broadcast_to(
+                jnp.arange(n_inputs, dtype=jnp.int32),
+                (hidden_dim, n_inputs),
+            )
+            incoming_ids = incoming_ids.at[start:end, :n_inputs].set(ids)
+            active_conn_mask = active_conn_mask.at[start:end, :n_inputs].set(True)
+        else:
+            prev_global_start = n_inputs + (k - 1) * hidden_dim
+            ids = jnp.broadcast_to(
+                jnp.arange(hidden_dim, dtype=jnp.int32) + prev_global_start,
+                (hidden_dim, hidden_dim),
+            )
+            incoming_ids = incoming_ids.at[start:end, :hidden_dim].set(ids)
+            active_conn_mask = active_conn_mask.at[start:end, :hidden_dim].set(True)
+
     network = eqx.tree_at(
         lambda s: s.hidden_states.connectivity.incoming_ids,
         network,
-        input_ids,
+        incoming_ids,
     )
     network = eqx.tree_at(
         lambda s: s.hidden_states.connectivity.active_connection_mask,
         network,
-        input_conn_mask,
+        active_conn_mask,
     )
 
-    # Connect output neurons to all hidden neurons
+    # Connect output neurons only to the last hidden layer
     max_out_conn = network.max_output_connections
-    hidden_abs_start = network.n_inputs
+    last_layer_global_start = n_inputs + (num_layers - 1) * hidden_dim
     output_incoming_ids = jnp.broadcast_to(
-        jnp.arange(hidden_dim, dtype=jnp.int32) + hidden_abs_start,
+        jnp.arange(hidden_dim, dtype=jnp.int32) + last_layer_global_start,
         (n_outputs, hidden_dim),
     )
-    # Pad to max_output_connections if needed
     if hidden_dim < max_out_conn:
-        pad_width = max_out_conn - hidden_dim
-        output_incoming_ids = jnp.pad(output_incoming_ids, ((0, 0), (0, pad_width)))
+        output_incoming_ids = jnp.pad(
+            output_incoming_ids, ((0, 0), (0, max_out_conn - hidden_dim)))
     output_conn_mask = jnp.zeros((n_outputs, max_out_conn), dtype=bool)
     output_conn_mask = output_conn_mask.at[:, :hidden_dim].set(True)
 
@@ -171,12 +192,23 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         output_conn_mask,
     )
 
-    # Initialize weights with small random values (Xavier-like)
-    key, w_hidden_key, w_output_key = random.split(key, 3)
-    hidden_weight_scale = jnp.sqrt(2.0 / n_inputs)
-    output_weight_scale = jnp.sqrt(2.0 / hidden_dim)
+    # Initialize weights with Xavier-like scaling per layer
+    hidden_weights = jnp.zeros((total_hidden, max_conn))
+    for k in range(num_layers):
+        start = k * hidden_dim
+        end = (k + 1) * hidden_dim
+        if k == 0:
+            scale = jnp.sqrt(2.0 / n_inputs)
+            n_conn = n_inputs
+        else:
+            scale = jnp.sqrt(2.0 / hidden_dim)
+            n_conn = hidden_dim
+        key, w_key = random.split(key)
+        w = random.normal(w_key, (hidden_dim, n_conn)) * scale
+        hidden_weights = hidden_weights.at[start:end, :n_conn].set(w)
 
-    hidden_weights = random.normal(w_hidden_key, (network.total_hidden, max_conn)) * hidden_weight_scale
+    key, w_output_key = random.split(key)
+    output_weight_scale = jnp.sqrt(2.0 / hidden_dim)
     output_weights = jnp.zeros((n_outputs, max_out_conn))
     output_weights = output_weights.at[:, :hidden_dim].set(
         random.normal(w_output_key, (n_outputs, hidden_dim)) * output_weight_scale)
@@ -278,7 +310,7 @@ def main():
     args = parse_args()
     train_state = init_experiment(args)
 
-    print(f'Network: {args.hidden_dim} hidden units, lr={args.learning_rate}')
+    print(f'Network: {args.num_layers} layer(s), {args.hidden_dim} hidden units, lr={args.learning_rate}')
     print(f'Task: y = [sin(x1+x2), cos(x1-x2)]')
 
     if args.mlflow:
