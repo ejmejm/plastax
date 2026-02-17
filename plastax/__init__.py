@@ -12,12 +12,11 @@ from plastax.network import (
 )
 from plastax.defaults import (
     DefaultForwardPassState,
+    DefaultNeuronState,
     default_structure_update_fn,
     make_default_backward_signal_fn,
     make_default_forward_fn,
     make_default_init_neuron_fn,
     make_default_neuron_update_fn,
     make_default_output_error_fn,
-    make_default_neuron_state,
-    make_default_output_neuron_state,
 )

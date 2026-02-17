@@ -16,6 +16,7 @@ import numpy as np
 from tqdm import tqdm
 
 from plastax import (
+    DefaultNeuronState,
     Network,
     StateUpdateFunctions,
     StructureUpdateState,
@@ -23,10 +24,8 @@ from plastax import (
     make_default_backward_signal_fn,
     make_default_forward_fn,
     make_default_init_neuron_fn,
-    make_default_neuron_state,
     make_default_neuron_update_fn,
     make_default_output_error_fn,
-    make_default_output_neuron_state,
 )
 
 
@@ -81,12 +80,15 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     n_inputs = 2
     n_outputs = 2
     hidden_dim = args.hidden_dim
-    max_connections = n_inputs  # hidden units connect to all inputs
-    max_output_connections = hidden_dim  # output connects to all hidden units
 
-    # Create neuron templates using defaults (with DefaultForwardPassState)
-    hidden_template = make_default_neuron_state(max_connections)
-    output_template = make_default_output_neuron_state(max_output_connections)
+    # Define neuron classes with baked-in max_connections
+    class HiddenNeuron(DefaultNeuronState):
+        def __init__(self):
+            super().__init__(max_connections=n_inputs)
+
+    class OutputNeuron(DefaultNeuronState):
+        def __init__(self):
+            super().__init__(max_connections=hidden_dim)
 
     # Build state update functions
     lr = args.learning_rate
@@ -97,7 +99,7 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         backward_signal_fn=make_default_backward_signal_fn(),
         neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
         structure_update_fn=default_structure_update_fn,
-        init_neuron_fn=make_default_init_neuron_fn(max_connections),
+        init_neuron_fn=make_default_init_neuron_fn(HiddenNeuron),
         compute_output_error_fn=make_default_output_error_fn(),
         output_forward_fn=make_default_forward_fn(identity),
         output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
@@ -110,12 +112,10 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         n_outputs=n_outputs,
         max_hidden_per_layer=hidden_dim,
         max_layers=1,
-        max_connections=max_connections,
-        max_output_connections=max_output_connections,
         max_generate_per_step=0,
         auto_connect_to_output=False,
-        hidden_neuron_template=hidden_template,
-        output_neuron_template=output_template,
+        hidden_neuron_cls=HiddenNeuron,
+        output_neuron_cls=OutputNeuron,
         state_update_fns=state_update_fns,
         structure_state=structure_state,
     )
@@ -129,11 +129,12 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     )
 
     # Set hidden neurons' incoming connections to the 2 input neurons
+    max_conn = network.max_connections
     input_ids = jnp.broadcast_to(
         jnp.arange(n_inputs, dtype=jnp.int32),
-        (network.total_hidden, max_connections),
+        (network.total_hidden, max_conn),
     )
-    input_conn_mask = jnp.ones((network.total_hidden, max_connections), dtype=bool)
+    input_conn_mask = jnp.ones((network.total_hidden, max_conn), dtype=bool)
     network = eqx.tree_at(
         lambda s: s.hidden_states.connectivity.incoming_ids,
         network,
@@ -146,16 +147,17 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     )
 
     # Connect output neurons to all hidden neurons
+    max_out_conn = network.max_output_connections
     hidden_abs_start = network.n_inputs
     output_incoming_ids = jnp.broadcast_to(
         jnp.arange(hidden_dim, dtype=jnp.int32) + hidden_abs_start,
         (n_outputs, hidden_dim),
     )
     # Pad to max_output_connections if needed
-    if hidden_dim < max_output_connections:
-        pad_width = max_output_connections - hidden_dim
+    if hidden_dim < max_out_conn:
+        pad_width = max_out_conn - hidden_dim
         output_incoming_ids = jnp.pad(output_incoming_ids, ((0, 0), (0, pad_width)))
-    output_conn_mask = jnp.zeros((n_outputs, max_output_connections), dtype=bool)
+    output_conn_mask = jnp.zeros((n_outputs, max_out_conn), dtype=bool)
     output_conn_mask = output_conn_mask.at[:, :hidden_dim].set(True)
 
     network = eqx.tree_at(
@@ -174,8 +176,8 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     hidden_weight_scale = jnp.sqrt(2.0 / n_inputs)
     output_weight_scale = jnp.sqrt(2.0 / hidden_dim)
 
-    hidden_weights = random.normal(w_hidden_key, (network.total_hidden, max_connections)) * hidden_weight_scale
-    output_weights = jnp.zeros((n_outputs, max_output_connections))
+    hidden_weights = random.normal(w_hidden_key, (network.total_hidden, max_conn)) * hidden_weight_scale
+    output_weights = jnp.zeros((n_outputs, max_out_conn))
     output_weights = output_weights.at[:, :hidden_dim].set(
         random.normal(w_output_key, (n_outputs, hidden_dim)) * output_weight_scale)
 
@@ -294,7 +296,7 @@ def main():
         y = jnp.array([jnp.sin(x[0] + x[1]), jnp.cos(x[0] - x[1])])
         # Quick forward pass for evaluation
         eval_net = eqx.tree_at(
-            lambda s: s.input_activations,
+            lambda s: s.input_values,
             train_state.network,
             x,
         )

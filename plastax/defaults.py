@@ -26,54 +26,21 @@ class DefaultForwardPassState(ForwardPassState):
     pre_activation: Float[Array, '']
     incoming_activations: Float[Array, 'max_connections']
 
+    def __init__(self, max_connections: int):
+        super().__init__()
+        self.pre_activation = jnp.array(0.0)
+        self.incoming_activations = jnp.zeros(max_connections)
+
 
 # ---------------------------------------------------------------------------
-# Default NeuronState using DefaultForwardPassState
+# Default NeuronState class
 # ---------------------------------------------------------------------------
 
 class DefaultNeuronState(NeuronState):
-    """NeuronState that uses DefaultForwardPassState for standard backprop."""
-    pass
+    """NeuronState using DefaultForwardPassState for standard backprop."""
 
-
-def make_default_neuron_state(max_connections: int) -> NeuronState:
-    """Create a zeroed-out DefaultNeuronState template for hidden neurons."""
-    return NeuronState(
-        active_mask=jnp.array(False),
-        connectivity=ConnectivityState(
-            incoming_ids=jnp.zeros(max_connections, dtype=jnp.int32),
-            weights=jnp.zeros(max_connections),
-            active_connection_mask=jnp.zeros(max_connections, dtype=bool),
-        ),
-        forward_state=DefaultForwardPassState(
-            activation_value=jnp.array(0.0),
-            pre_activation=jnp.array(0.0),
-            incoming_activations=jnp.zeros(max_connections),
-        ),
-        backward_state=BackwardPassState(
-            error_signal=jnp.array(0.0),
-        ),
-    )
-
-
-def make_default_output_neuron_state(max_output_connections: int) -> NeuronState:
-    """Create a zeroed-out NeuronState template for output neurons."""
-    return NeuronState(
-        active_mask=jnp.array(False),
-        connectivity=ConnectivityState(
-            incoming_ids=jnp.zeros(max_output_connections, dtype=jnp.int32),
-            weights=jnp.zeros(max_output_connections),
-            active_connection_mask=jnp.zeros(max_output_connections, dtype=bool),
-        ),
-        forward_state=DefaultForwardPassState(
-            activation_value=jnp.array(0.0),
-            pre_activation=jnp.array(0.0),
-            incoming_activations=jnp.zeros(max_output_connections),
-        ),
-        backward_state=BackwardPassState(
-            error_signal=jnp.array(0.0),
-        ),
-    )
+    def __init__(self, max_connections: int):
+        super().__init__(max_connections, forward_state=DefaultForwardPassState(max_connections))
 
 
 # ---------------------------------------------------------------------------
@@ -203,25 +170,15 @@ def default_structure_update_fn(
 # Default init neuron function
 # ---------------------------------------------------------------------------
 
-def make_default_init_neuron_fn(max_connections: int) -> Callable:
+def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
     """Create an init function that returns a zeroed NeuronState with the given connectivity."""
     def init_neuron_fn(
         connectivity: ConnectivityState,
         index: Int[Array, ''],
         key: jax.Array,
     ) -> NeuronState:
-        return NeuronState(
-            active_mask=jnp.array(True),
-            connectivity=connectivity,
-            forward_state=DefaultForwardPassState(
-                activation_value=jnp.array(0.0),
-                pre_activation=jnp.array(0.0),
-                incoming_activations=jnp.zeros(max_connections),
-            ),
-            backward_state=BackwardPassState(
-                error_signal=jnp.array(0.0),
-            ),
-        )
+        state = neuron_cls()
+        return tree_replace(state, active_mask=jnp.array(True), connectivity=connectivity)
     return init_neuron_fn
 
 

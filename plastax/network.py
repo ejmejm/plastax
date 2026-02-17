@@ -49,7 +49,7 @@ class Network(eqx.Module):
     state_update_fns: StateUpdateFunctions = eqx.field(static=True)
 
     # Dynamic (state)
-    input_activations: Float[Array, 'n_inputs']
+    input_values: Float[Array, 'n_inputs']
     hidden_states: NeuronState
     output_states: NeuronState
     structure_state: StructureUpdateState
@@ -61,10 +61,8 @@ class Network(eqx.Module):
         n_outputs: int,
         max_hidden_per_layer: int,
         max_layers: int,
-        max_connections: int,
-        max_output_connections: int,
-        hidden_neuron_template: NeuronState,
-        output_neuron_template: NeuronState,
+        hidden_neuron_cls: type[NeuronState] = NeuronState,
+        output_neuron_cls: type[NeuronState] = None,
         state_update_fns: StateUpdateFunctions,
         structure_state: StructureUpdateState,
         max_generate_per_step: int = 0,
@@ -72,16 +70,15 @@ class Network(eqx.Module):
     ):
         """Create a Network with inputs directly connected to outputs, all hidden inactive.
 
-        Takes single-neuron templates and broadcasts them to create the full
-        state arrays.  Output neurons are activated and wired to receive from
-        all input units.
+        Uses the given NeuronState classes (or subclasses) to construct the
+        initial state arrays.  max_connections and max_output_connections are
+        derived from the constructed neurons' connectivity shapes.  Output
+        neurons are activated and wired to receive from all input units.
         """
         self.n_inputs = n_inputs
         self.n_outputs = n_outputs
         self.max_hidden_per_layer = max_hidden_per_layer
         self.max_layers = max_layers
-        self.max_connections = max_connections
-        self.max_output_connections = max_output_connections
         self.max_generate_per_step = max_generate_per_step
         self.auto_connect_to_output = auto_connect_to_output
         self.state_update_fns = state_update_fns
@@ -95,17 +92,17 @@ class Network(eqx.Module):
         )
 
         # Input activations default to zeros
-        self.input_activations = jnp.zeros(n_inputs)
+        self.input_values = jnp.zeros(n_inputs)
 
-        # Broadcast single-neuron templates to full state arrays
-        hidden_states = jax.tree.map(
-            lambda x: jnp.broadcast_to(x, (total_hidden,) + x.shape).copy(),
-            hidden_neuron_template,
-        )
-        output_states = jax.tree.map(
-            lambda x: jnp.broadcast_to(x, (n_outputs,) + x.shape).copy(),
-            output_neuron_template,
-        )
+        # If output_neuron_cls is None, use hidden_neuron_cls
+        if output_neuron_cls is None:
+            output_neuron_cls = hidden_neuron_cls
+
+        # Create initial states by vmapping over constructors
+        hidden_states = jax.vmap(lambda _: hidden_neuron_cls())(jnp.arange(total_hidden))
+        output_states = jax.vmap(lambda _: output_neuron_cls())(jnp.arange(n_outputs))
+        self.max_connections = hidden_states.connectivity.weights.shape[-1]
+        self.max_output_connections = output_states.connectivity.weights.shape[-1]
 
         # Activate output neurons
         output_states = eqx.tree_at(
@@ -113,18 +110,21 @@ class Network(eqx.Module):
             jnp.ones(n_outputs, dtype=bool),
         )
 
-        # Connect output neurons to input neurons
-        output_incoming_ids = jnp.zeros((n_outputs, max_output_connections), dtype=jnp.int32)
-        output_conn_mask = jnp.zeros((n_outputs, max_output_connections), dtype=bool)
-        input_ids = jnp.arange(n_inputs, dtype=jnp.int32)
-        for i in range(n_outputs):
-            output_incoming_ids = output_incoming_ids.at[i, :n_inputs].set(input_ids)
-            output_conn_mask = output_conn_mask.at[i, :n_inputs].set(True)
-
-        output_states = eqx.tree_at(
-            lambda s: s.connectivity.incoming_ids, output_states, output_incoming_ids)
-        output_states = eqx.tree_at(
-            lambda s: s.connectivity.active_connection_mask, output_states, output_conn_mask)
+        # Optionally connect output neurons to input neurons
+        if auto_connect_to_output:
+            input_ids = jnp.arange(n_inputs, dtype=jnp.int32)
+            conn = output_states.connectivity
+            conn = tree_replace(
+                conn,
+                incoming_ids=conn.incoming_ids.at[:, :n_inputs].set(input_ids),
+                weights=conn.weights.at[:, :n_inputs].set(0.0),
+                active_connection_mask=conn.active_connection_mask.at[:, :n_inputs].set(True),
+            )
+            output_states = eqx.tree_at(
+                lambda s: s.connectivity,
+                output_states,
+                conn,
+            )
 
         self.hidden_states = hidden_states
         self.output_states = output_states
@@ -142,7 +142,7 @@ class Network(eqx.Module):
     ) -> 'Network':
         """Run one full step: forward -> backward -> structure update -> generation."""
         fns = self.state_update_fns
-        network = tree_replace(self, input_activations=inputs)
+        network = tree_replace(self, input_values=inputs)
         network = network._forward_pass(fns.forward_fn, fns.output_forward_fn)
         network = network._backward_pass(targets, fns)
         network, generation_specs = network._structure_update(fns.structure_update_fn)
@@ -291,7 +291,7 @@ class Network(eqx.Module):
 
     def _build_all_activations(self) -> Float[Array, 'total_neurons']:
         return jnp.concatenate([
-            self.input_activations,
+            self.input_values,
             self.hidden_states.forward_state.activation_value,
             self.output_states.forward_state.activation_value,
         ])
@@ -454,7 +454,8 @@ class Network(eqx.Module):
                         jnp.where(is_valid, prior_ids[jnp.minimum(c, n_prior - 1)], 0))
                     conn_mask = conn_mask.at[c].set(is_valid)
 
-                connectivity = ConnectivityState(
+                connectivity = tree_replace(
+                    ConnectivityState(self.max_connections),
                     incoming_ids=incoming_ids, weights=weights,
                     active_connection_mask=conn_mask,
                 )
@@ -497,7 +498,8 @@ class Network(eqx.Module):
         slot = jnp.argmin(conn_mask)
         has_slot = ~conn_mask[slot]
 
-        updated = ConnectivityState(
+        updated = tree_replace(
+            connectivity,
             incoming_ids=connectivity.incoming_ids.at[to_idx, slot].set(from_idx),
             weights=connectivity.weights.at[to_idx, slot].set(weight),
             active_connection_mask=connectivity.active_connection_mask.at[to_idx, slot].set(True),
