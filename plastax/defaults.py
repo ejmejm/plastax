@@ -171,13 +171,35 @@ def default_structure_update_fn(
 # ---------------------------------------------------------------------------
 
 def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
-    """Create an init function that returns a zeroed NeuronState with the given connectivity."""
+    """Create an init function that randomly connects to a subset of connectable neurons.
+
+    The returned function receives the full hidden states and a connectable mask
+    over the global index space, then randomly selects up to max_connections
+    neurons to connect to.
+    """
     def init_neuron_fn(
-        connectivity: ConnectivityState,
+        hidden_states: NeuronState,
+        connectable_mask: Bool[Array, 'total_neurons'],
         index: Int[Array, ''],
         key: jax.Array,
     ) -> NeuronState:
         state = neuron_cls()
+        max_conn = state.connectivity.weights.shape[0]
+        n_total = connectable_mask.shape[0]
+
+        # Shuffle indices, then sort connectable ones to the front
+        shuffled = jax.random.permutation(key, n_total)
+        # Connectable indices get low sort keys (0), non-connectable get high (1)
+        sort_keys = jnp.where(connectable_mask[shuffled], 0, 1)
+        selected = shuffled[jnp.argsort(sort_keys)[:max_conn]]
+        is_connected = connectable_mask[selected]
+
+        connectivity = tree_replace(
+            state.connectivity,
+            incoming_ids=jnp.where(is_connected, selected, 0),
+            weights=jnp.zeros(max_conn),
+            active_connection_mask=is_connected,
+        )
         return tree_replace(state, active_mask=jnp.array(True), connectivity=connectivity)
     return init_neuron_fn
 

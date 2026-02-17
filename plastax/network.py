@@ -144,8 +144,7 @@ class Network(eqx.Module):
         network = tree_replace(self, input_values=inputs)
         network = network._forward_pass()
         network = network._backward_pass(targets)
-        network, generation_specs = network._structure_update()
-        network = network._generate_neurons(generation_specs, key)
+        network = network._structure_update(key)
         return network
 
     # -----------------------------------------------------------------------
@@ -193,7 +192,8 @@ class Network(eqx.Module):
         output_states = self.output_states
         if connect_to_output:
             abs_index = hidden_rel + self.n_inputs
-            output_states = self._auto_connect_to_output(output_states, abs_index, has_slot)
+            output_states = self._auto_connect_to_output(
+                output_states, abs_index[None], has_slot[None])
 
         return tree_replace(self, hidden_states=hidden_states, output_states=output_states), has_slot
 
@@ -370,99 +370,108 @@ class Network(eqx.Module):
 
         return tree_replace(self, hidden_states=hidden_states, output_states=output_states)
 
-    def _structure_update(self) -> Tuple['Network', list]:
-        """Run structure update for each hidden layer (last to first)."""
+    def _build_connectable_mask(
+        self,
+        hidden_states: NeuronState,
+        layer_k: int,
+    ) -> Bool[Array, 'n_inputs+total_hidden']:
+        """Mask over global index space: inputs (always True) + active hidden neurons
+        in all layers prior to layer_k."""
+        prior_end = self.layer_boundaries[layer_k - 1][1] if layer_k > 0 else 0
+        return jnp.concatenate([
+            jnp.ones(self.n_inputs, dtype=bool), # inputs are always connectable
+            hidden_states.active_mask[:prior_end], # all active neurons in layers prior to layer_k
+            jnp.zeros(self.total_hidden - prior_end, dtype=bool), # no neurons in layer_k and beyond
+        ])
+
+    def _generate_into_layer(
+        self,
+        hidden_states: NeuronState,
+        start: int,
+        end: int,
+        n_generate,
+        connectable_mask: Bool[Array, 'n_inputs+total_hidden'],
+        unit_keys: PRNGKeyArray,
+    ) -> Tuple[NeuronState, Int[Array, 'n_gen'], Bool[Array, 'n_gen']]:
+        """Generate new neurons into inactive slots via init_neuron_fn.
+
+        Currently only incoming connections are set by init_neuron_fn.
+        TODO: in the future we may also want to allow init_neuron_fn to
+        specify outgoing connections for the new neuron.
+
+        Returns updated hidden_states, absolute indices of the slots used,
+        and a mask of which slots actually had neurons generated.
+        """
+        # Find up to n_gen inactive slots, and decide which ones to fill
+        n_gen = self.max_generate_per_step
+        layer_active = hidden_states.active_mask[start:end]
+        slots = jnp.argsort(layer_active.astype(jnp.int32))[:n_gen]
+        should_generate = ~layer_active[slots] & (jnp.arange(n_gen) < n_generate)
+
+        # Initialize new neurons in parallel
+        abs_indices = start + slots + self.n_inputs
+        new_neurons = jax.vmap(
+            self.state_update_fns.init_neuron_fn, in_axes=(None, None, 0, 0)
+        )(hidden_states, connectable_mask, abs_indices, unit_keys)
+
+        # Conditionally scatter into the layer
+        layer = self._get_layer_states(hidden_states, start, end)
+        existing = jax.tree.map(lambda x: x[slots], layer)
+        # Broadcast mask across all fields of the neuron state
+        gen_mask = should_generate[:, None]
+        masked = jax.tree.map(
+            lambda e, n: jnp.where(gen_mask, n, e), existing, new_neurons)
+        layer = jax.tree.map(lambda full, vals: full.at[slots].set(vals), layer, masked)
+        hidden_states = self._set_layer_states(hidden_states, start, end, layer)
+        return hidden_states, abs_indices, should_generate
+
+    def _structure_update(self, key: PRNGKeyArray) -> 'Network':
+        """Run structure update for each hidden layer (last to first).
+
+        For each layer: decide what to prune/generate, apply pruning,
+        then immediately generate new neurons so that lower layers can
+        see the updated state from upper layers.
+        """
+        fns = self.state_update_fns
         hidden_states = self.hidden_states
         output_states = self.output_states
         structure_state = self.structure_state
-        generation_specs = []
 
         for layer_k in range(self.max_layers - 1, -1, -1):
             start, end = self.layer_boundaries[layer_k]
             layer_states = self._get_layer_states(hidden_states, start, end)
 
+            # Get the layer above (output or next hidden) for structure decisions
             if layer_k == self.max_layers - 1:
                 next_layer_states = output_states
             else:
                 next_start, next_end = self.layer_boundaries[layer_k + 1]
                 next_layer_states = self._get_layer_states(hidden_states, next_start, next_end)
 
-            structure_state, prune_mask, n_generate = self.state_update_fns.structure_update_fn(
+            # Decide which neurons to prune and how many to generate
+            structure_state, prune_mask, n_generate = fns.structure_update_fn(
                 layer_states, next_layer_states, structure_state)
 
+            # Prune neurons and clean up dangling connections
             hidden_states, output_states = self._apply_pruning(
                 hidden_states, output_states, self.n_inputs, start, end, prune_mask)
 
-            generation_specs.append((layer_k, n_generate))
+            # Generate new neurons for this layer
+            n_gen = self.max_generate_per_step
+            keys = jax.random.split(key, n_gen + 1)
+            key = keys[0]
 
-        updated = tree_replace(self, hidden_states=hidden_states, output_states=output_states,
-                               structure_state=structure_state)
-        return updated, generation_specs
+            connectable_mask = self._build_connectable_mask(hidden_states, layer_k)
+            hidden_states, abs_indices, did_generate = self._generate_into_layer(
+                hidden_states, start, end, n_generate, connectable_mask, keys[1:])
 
-    def _generate_neurons(
-        self,
-        generation_specs: list,
-        key: PRNGKeyArray,
-    ) -> 'Network':
-        """Generate new neurons as specified by the structure update."""
-        hidden_states = self.hidden_states
-        output_states = self.output_states
+            # Wire output neurons to the new neurons if auto-connecting
+            if self.auto_connect_to_output:
+                output_states = self._auto_connect_to_output(
+                    output_states, abs_indices, did_generate)
 
-        for layer_k, n_generate in generation_specs:
-            start, end = self.layer_boundaries[layer_k]
-            key, gen_key = jax.random.split(key)
-
-            if layer_k == 0:
-                prior_ids = jnp.arange(self.n_inputs)
-                prior_active = jnp.ones(self.n_inputs, dtype=bool)
-            else:
-                prev_start, prev_end = self.layer_boundaries[layer_k - 1]
-                prior_ids = jnp.arange(prev_start, prev_end) + self.n_inputs
-                prior_active = hidden_states.active_mask[prev_start:prev_end]
-
-            for gen_idx in range(self.max_generate_per_step):
-                key, unit_key = jax.random.split(key)
-
-                layer_active = hidden_states.active_mask[start:end]
-                slot = jnp.argmin(layer_active)
-                has_slot = ~layer_active[slot]
-                should_generate = has_slot & (gen_idx < n_generate)
-
-                incoming_ids = jnp.zeros(self.max_connections, dtype=jnp.int32)
-                conn_mask = jnp.zeros(self.max_connections, dtype=bool)
-                weights = jnp.zeros(self.max_connections)
-
-                n_prior = prior_ids.shape[0]
-                n_to_connect = jnp.minimum(n_prior, self.max_connections)
-                for c in range(self.max_connections):
-                    is_valid = (c < n_to_connect) & (c < n_prior) & prior_active[jnp.minimum(c, n_prior - 1)]
-                    incoming_ids = incoming_ids.at[c].set(
-                        jnp.where(is_valid, prior_ids[jnp.minimum(c, n_prior - 1)], 0))
-                    conn_mask = conn_mask.at[c].set(is_valid)
-
-                connectivity = tree_replace(
-                    ConnectivityState(self.max_connections),
-                    incoming_ids=incoming_ids, weights=weights,
-                    active_connection_mask=conn_mask,
-                )
-
-                abs_index = start + slot + self.n_inputs
-                new_neuron = self.state_update_fns.init_neuron_fn(connectivity, abs_index, unit_key)
-
-                new_neuron_active = tree_replace(new_neuron, active_mask=jnp.array(True))
-                layer_states = self._get_layer_states(hidden_states, start, end)
-
-                updated_layer = jax.tree.map(
-                    lambda full, single: jnp.where(should_generate, full.at[slot].set(single), full),
-                    layer_states, new_neuron_active,
-                )
-                hidden_states = self._set_layer_states(hidden_states, start, end, updated_layer)
-
-                if self.auto_connect_to_output:
-                    output_states = self._auto_connect_to_output(
-                        output_states, abs_index, should_generate)
-
-        return tree_replace(self, hidden_states=hidden_states, output_states=output_states)
+        return tree_replace(self, hidden_states=hidden_states, output_states=output_states,
+                            structure_state=structure_state)
 
     # -----------------------------------------------------------------------
     # Static helpers
@@ -563,28 +572,38 @@ class Network(eqx.Module):
     @staticmethod
     def _auto_connect_to_output(
         output_states: NeuronState,
-        neuron_abs_index: Int[Array, ''],
-        should_connect: Bool[Array, ''],
+        neuron_abs_indices: Int[Array, 'n'],
+        should_connect: Bool[Array, 'n'],
     ) -> NeuronState:
-        """Add a connection from a new hidden neuron to each output unit."""
-        n_outputs = output_states.active_mask.shape[0]
-        for out_idx in range(n_outputs):
-            conn_mask = output_states.connectivity.active_connection_mask[out_idx]
-            slot = jnp.argmin(conn_mask)
-            has_slot = ~conn_mask[slot]
-            do_connect = should_connect & has_slot
+        """Add connections from new hidden neurons to each output unit.
 
-            output_states = eqx.tree_at(
-                lambda s: s.connectivity.incoming_ids, output_states,
-                jnp.where(do_connect,
-                          output_states.connectivity.incoming_ids.at[out_idx, slot].set(neuron_abs_index),
-                          output_states.connectivity.incoming_ids),
-            )
-            output_states = eqx.tree_at(
-                lambda s: s.connectivity.active_connection_mask, output_states,
-                jnp.where(do_connect,
-                          output_states.connectivity.active_connection_mask.at[out_idx, slot].set(True),
-                          output_states.connectivity.active_connection_mask),
-            )
+        For each output neuron, finds n inactive slots and assigns one per
+        new hidden neuron, masked by should_connect.
+        """
+        conn = output_states.connectivity
+        n = neuron_abs_indices.shape[0]
 
-        return output_states
+        # For each output neuron, find n inactive slots via argsort
+        # sorted_indices shape: (n_outputs, max_output_connections)
+        sorted_indices = jnp.argsort(
+            conn.active_connection_mask.astype(jnp.int32), axis=1)
+        slots = sorted_indices[:, :n]  # (n_outputs, n)
+
+        # Check which slots are actually inactive
+        out_idx = jnp.arange(conn.active_connection_mask.shape[0])[:, None]
+        has_slot = ~conn.active_connection_mask[out_idx, slots]  # (n_outputs, n)
+        do_connect = has_slot & should_connect[None, :]  # (n_outputs, n)
+
+        # Build updated values, keeping originals where we shouldn't connect
+        existing_ids = conn.incoming_ids[out_idx, slots]
+        new_ids = jnp.where(do_connect, neuron_abs_indices[None, :], existing_ids)
+        existing_mask = conn.active_connection_mask[out_idx, slots]
+        new_mask = jnp.where(do_connect, True, existing_mask)
+
+        # Scatter updates
+        updated_conn = tree_replace(
+            conn,
+            incoming_ids=conn.incoming_ids.at[out_idx, slots].set(new_ids),
+            active_connection_mask=conn.active_connection_mask.at[out_idx, slots].set(new_mask),
+        )
+        return eqx.tree_at(lambda s: s.connectivity, output_states, updated_conn)
