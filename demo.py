@@ -19,9 +19,10 @@ from plastax import (
     default_structure_update_fn,
     make_default_backward_signal_fn,
     make_default_forward_fn,
-    make_default_init_neuron_fn,
     make_default_neuron_update_fn,
     make_default_output_error_fn,
+    make_init_neuron_fn,
+    make_prior_layer_connector,
 )
 
 
@@ -72,13 +73,15 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     # State update functions (ReLU hidden, linear output, SGD weight updates)
     lr = args.learning_rate
     identity = lambda x: x
+    weight_init = jax.nn.initializers.normal(stddev=jnp.sqrt(2.0 / hidden_dim))
+    connector = make_prior_layer_connector(n_inputs, hidden_dim)
 
     fns = StateUpdateFunctions(
         forward_fn=make_default_forward_fn(jax.nn.relu),
         backward_signal_fn=make_default_backward_signal_fn(),
         neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
         structure_update_fn=default_structure_update_fn,
-        init_neuron_fn=make_default_init_neuron_fn(HiddenNeuron),
+        init_neuron_fn=make_init_neuron_fn(HiddenNeuron, connector, weight_init),
         compute_output_error_fn=make_default_output_error_fn(),
         output_forward_fn=make_default_forward_fn(identity),
         output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
@@ -97,65 +100,16 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         structure_state=StructureUpdateState(),
     )
 
-    # Activate all hidden neurons
-    network = eqx.tree_at(
-        lambda s: s.hidden_states.active_mask,
-        network,
-        jnp.ones(network.total_hidden, dtype=bool),
-    )
-
-    # Wire up connectivity and weights for each hidden layer
+    # Initialize each hidden layer (sequential so each sees prior layers' neurons)
     key = random.PRNGKey(args.seed)
-    max_conn = network.max_connections
-    total_hidden = network.total_hidden
-    incoming_ids = jnp.zeros((total_hidden, max_conn), dtype=jnp.int32)
-    conn_mask = jnp.zeros((total_hidden, max_conn), dtype=bool)
-    weights = jnp.zeros((total_hidden, max_conn))
-
     for k in range(num_layers):
-        start, end = k * hidden_dim, (k + 1) * hidden_dim
-        if k == 0:
-            n_conn, prev_start = n_inputs, 0
-        else:
-            n_conn, prev_start = hidden_dim, n_inputs + (k - 1) * hidden_dim
+        key, layer_key = random.split(key)
+        network = network.initialize_layer(k, layer_key)
 
-        ids = jnp.broadcast_to(
-            jnp.arange(n_conn, dtype=jnp.int32) + prev_start,
-            (hidden_dim, n_conn),
-        )
-        incoming_ids = incoming_ids.at[start:end, :n_conn].set(ids)
-        conn_mask = conn_mask.at[start:end, :n_conn].set(True)
-
-        key, w_key = random.split(key)
-        scale = jnp.sqrt(2.0 / n_conn)
-        weights = weights.at[start:end, :n_conn].set(
-            random.normal(w_key, (hidden_dim, n_conn)) * scale)
-
-    network = eqx.tree_at(
-        lambda s: (s.hidden_states.incoming_ids,
-                   s.hidden_states.active_connection_mask,
-                   s.hidden_states.weights),
-        network,
-        (incoming_ids, conn_mask, weights),
-    )
-
-    # Wire output neurons to the last hidden layer
-    last_start = n_inputs + (num_layers - 1) * hidden_dim
-    out_ids = jnp.broadcast_to(
-        jnp.arange(hidden_dim, dtype=jnp.int32) + last_start,
-        (n_outputs, hidden_dim),
-    )
-    out_conn_mask = jnp.ones((n_outputs, hidden_dim), dtype=bool)
-    key, w_key = random.split(key)
-    out_weights = random.normal(w_key, (n_outputs, hidden_dim)) * jnp.sqrt(2.0 / hidden_dim)
-
-    network = eqx.tree_at(
-        lambda s: (s.output_states.incoming_ids,
-                   s.output_states.active_connection_mask,
-                   s.output_states.weights),
-        network,
-        (out_ids, out_conn_mask, out_weights),
-    )
+    # Connect last hidden layer to outputs
+    key, out_key = random.split(key)
+    network = network.connect_to_output(
+        network.get_units_in_layer(-1), weight_init, out_key)
 
     return TrainState(network=network, rng=key, step=jnp.array(0))
 

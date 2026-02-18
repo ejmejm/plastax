@@ -139,6 +139,94 @@ class Network(eqx.Module):
         network = network._structure_update(key)
         return network
 
+    def get_units_in_layer(self, layer_k: int) -> Int[Array, 'max_hidden_per_layer']:
+        """Return absolute indices for all neuron slots in hidden layer layer_k.
+
+        Supports negative indexing: -1 is the last layer.
+        """
+        if layer_k < 0:
+            layer_k = self.max_layers + layer_k
+        start, end = self.layer_boundaries[layer_k]
+        return jnp.arange(start, end) + self.n_inputs
+
+    def initialize_layer(
+        self,
+        layer_k: int,
+        key: PRNGKeyArray,
+        init_fn: Callable | None = None,
+    ) -> 'Network':
+        """Initialize all neurons in a hidden layer using init_fn (vmapped).
+
+        If init_fn is None, uses self.state_update_fns.init_neuron_fn.
+        Should be called sequentially from layer 0 upward so that each layer's
+        active neurons are visible to subsequent layers via the connectable mask.
+
+        Supports negative indexing for layer_k.
+        """
+        if init_fn is None:
+            init_fn = self.state_update_fns.init_neuron_fn
+        if layer_k < 0:
+            layer_k = self.max_layers + layer_k
+
+        start, end = self.layer_boundaries[layer_k]
+        connectable_mask = self._build_connectable_mask(self.hidden_states, layer_k)
+        abs_indices = jnp.arange(start, end) + self.n_inputs
+        keys = jax.random.split(key, end - start)
+
+        new_states = jax.vmap(
+            init_fn, in_axes=(None, None, 0, 0)
+        )(self.hidden_states, connectable_mask, abs_indices, keys)
+
+        hidden_states = self._set_layer_states(self.hidden_states, start, end, new_states)
+        return tree_replace(self, hidden_states=hidden_states)
+
+    def connect_to_output(
+        self,
+        from_indices: Int[Array, 'n_from'],
+        weight_init: Callable | None = None,
+        key: PRNGKeyArray | None = None,
+    ) -> 'Network':
+        """Connect hidden neurons to all output neurons.
+
+        For each output neuron, finds inactive connection slots and assigns one
+        per from_index. Optionally initializes weights using a JAX nn initializer.
+
+        Args:
+            from_indices: Absolute indices of hidden neurons to connect from.
+            weight_init: Optional (key, shape, dtype) -> Array initializer.
+            key: PRNG key, required if weight_init is provided.
+        """
+        n_from = from_indices.shape[0]
+        output_states = self.output_states
+
+        # For each output neuron, find n_from inactive slots via argsort
+        sorted_indices = jnp.argsort(
+            output_states.active_connection_mask.astype(jnp.int32), axis=1)
+        slots = sorted_indices[:, :n_from]
+
+        out_idx = jnp.arange(self.n_outputs)[:, None]
+        has_slot = ~output_states.active_connection_mask[out_idx, slots]
+
+        # Set incoming IDs and connection mask
+        new_ids = jnp.where(has_slot, from_indices[None, :],
+                            output_states.incoming_ids[out_idx, slots])
+        new_mask = jnp.where(has_slot, True,
+                             output_states.active_connection_mask[out_idx, slots])
+
+        updates = dict(
+            incoming_ids=output_states.incoming_ids.at[out_idx, slots].set(new_ids),
+            active_connection_mask=output_states.active_connection_mask.at[out_idx, slots].set(new_mask),
+        )
+
+        # Optionally initialize weights
+        if weight_init is not None:
+            init_weights = weight_init(key, (self.n_outputs, n_from), jnp.float32)
+            new_weights = jnp.where(has_slot, init_weights,
+                                    output_states.weights[out_idx, slots])
+            updates['weights'] = output_states.weights.at[out_idx, slots].set(new_weights)
+
+        return tree_replace(self, output_states=tree_replace(output_states, **updates))
+
     # -----------------------------------------------------------------------
     # Ops (public)
     # -----------------------------------------------------------------------

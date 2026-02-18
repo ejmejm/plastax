@@ -147,15 +147,82 @@ def default_structure_update_fn(
 
 
 # ---------------------------------------------------------------------------
-# Default init neuron function
+# Connectors and init neuron functions
 # ---------------------------------------------------------------------------
 
-def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
-    """Create an init function that randomly connects to a subset of connectable neurons.
+def _select_random(
+    mask: Bool[Array, 'n'],
+    max_connections: int,
+    key: jax.Array,
+) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+    """Randomly select up to max_connections indices where mask is True.
 
-    The returned function receives the full hidden states and a connectable mask
-    over the global index space, then randomly selects up to max_connections
-    neurons to connect to.
+    Uses shuffle + argsort to be JIT-compatible. Returns (incoming_ids, active_mask).
+    """
+    n_total = mask.shape[0]
+    shuffled = jax.random.permutation(key, n_total)
+    sort_keys = jnp.where(mask[shuffled], 0, 1)
+    selected = shuffled[jnp.argsort(sort_keys)[:max_connections]]
+    is_connected = mask[selected]
+    return jnp.where(is_connected, selected, 0), is_connected
+
+
+def random_connector(
+    connectable_mask: Bool[Array, 'total_neurons'],
+    index: Int[Array, ''],
+    max_connections: int,
+    key: jax.Array,
+) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+    """Randomly connect to neurons from the entire connectable set."""
+    return _select_random(connectable_mask, max_connections, key)
+
+
+def make_prior_layer_connector(
+    n_inputs: int,
+    max_hidden_per_layer: int,
+) -> Callable:
+    """Create a connector that randomly connects to neurons in the prior layer only.
+
+    For layer 0, the prior layer is the inputs. For layer k > 0, it is the
+    hidden layer at k-1.
+    """
+    def connector(
+        connectable_mask: Bool[Array, 'total_neurons'],
+        index: Int[Array, ''],
+        max_connections: int,
+        key: jax.Array,
+    ) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+        layer_k = (index - n_inputs) // max_hidden_per_layer
+        prior_start = jnp.where(layer_k == 0, 0,
+                                n_inputs + (layer_k - 1) * max_hidden_per_layer)
+        prior_end = jnp.where(layer_k == 0, n_inputs,
+                              n_inputs + layer_k * max_hidden_per_layer)
+
+        all_indices = jnp.arange(connectable_mask.shape[0])
+        prior_mask = connectable_mask & (all_indices >= prior_start) & (all_indices < prior_end)
+        return _select_random(prior_mask, max_connections, key)
+
+    return connector
+
+
+def make_init_neuron_fn(
+    neuron_cls: type[NeuronState],
+    connector: Callable,
+    weight_init: Callable | None = None,
+) -> Callable:
+    """Create an init function with pluggable connectivity and weight initialization.
+
+    Args:
+        neuron_cls: NeuronState subclass with no-arg constructor.
+        connector: Function (connectable_mask, index, max_connections, key)
+            -> (incoming_ids, active_connection_mask).
+        weight_init: Optional initializer (key, shape, dtype) -> Array.
+            Called with shape (max_connections,). Use jax.nn.initializers.normal,
+            uniform, etc. Fan-in-based initializers like he_normal require 2D
+            shapes and won't work directly. If None, weights default to zeros.
+
+    Returns:
+        init_neuron_fn(hidden_states, connectable_mask, index, key) -> NeuronState
     """
     def init_neuron_fn(
         hidden_states: NeuronState,
@@ -165,23 +232,34 @@ def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
     ) -> NeuronState:
         state = neuron_cls()
         max_conn = state.weights.shape[0]
-        n_total = connectable_mask.shape[0]
 
-        # Shuffle indices, then sort connectable ones to the front
-        shuffled = jax.random.permutation(key, n_total)
-        # Connectable indices get low sort keys (0), non-connectable get high (1)
-        sort_keys = jnp.where(connectable_mask[shuffled], 0, 1)
-        selected = shuffled[jnp.argsort(sort_keys)[:max_conn]]
-        is_connected = connectable_mask[selected]
+        conn_key, weight_key = jax.random.split(key)
+        incoming_ids, active_mask = connector(connectable_mask, index, max_conn, conn_key)
+
+        if weight_init is not None:
+            weights = weight_init(weight_key, (max_conn,), jnp.float32)
+            weights = jnp.where(active_mask, weights, 0.0)
+        else:
+            weights = jnp.zeros(max_conn)
 
         return tree_replace(
             state,
             active_mask=jnp.array(True),
-            incoming_ids=jnp.where(is_connected, selected, 0),
-            weights=jnp.zeros(max_conn),
-            active_connection_mask=is_connected,
+            incoming_ids=incoming_ids,
+            weights=weights,
+            active_connection_mask=active_mask,
         )
+
     return init_neuron_fn
+
+
+def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
+    """Create an init function that randomly connects with zero weights.
+
+    Convenience wrapper around make_init_neuron_fn with random_connector
+    and no weight initialization.
+    """
+    return make_init_neuron_fn(neuron_cls, random_connector)
 
 
 # ---------------------------------------------------------------------------
