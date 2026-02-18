@@ -7,7 +7,7 @@ from plastax.network import (
     Network,
     StateUpdateFunctions,
 )
-from plastax.defaults import (
+from plastax.standard import (
     BackpropNeuronState,
     lecun_uniform,
     make_backprop_error_signal_fn,
