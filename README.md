@@ -172,6 +172,7 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 - [ ] Add pipelined version of the model, which entails making a parent class with everything except for the framework-defined transition functions, then having different children classes that implement those differently for global and pipelined computation.
 - [ ] Add the ability to set outgoing connections on new unit init.
 - [ ] Add tests for core functionality.
+- [ ] Add a notion of location to units, be it a layer index or an n-dimensional index to pass to connectivity init functions.
 
 **Usability changes:**
 - [ ] Change the wording of defaults to clearly indicate that it is doing backprop and standard ML stuff. The word default says nothing about what they do. You can have alternative names that call them default.

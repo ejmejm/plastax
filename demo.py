@@ -21,7 +21,7 @@ from plastax import (
     make_default_forward_fn,
     make_default_neuron_update_fn,
     make_default_output_error_fn,
-    make_init_neuron_fn,
+    make_default_state_init_fn,
     make_prior_layer_connector,
 )
 
@@ -73,7 +73,6 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     # State update functions (ReLU hidden, linear output, SGD weight updates)
     lr = args.learning_rate
     identity = lambda x: x
-    weight_init = jax.nn.initializers.normal(stddev=jnp.sqrt(2.0 / hidden_dim))
     connector = make_prior_layer_connector(n_inputs, hidden_dim)
 
     fns = StateUpdateFunctions(
@@ -81,10 +80,14 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         backward_signal_fn=make_default_backward_signal_fn(),
         neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
         structure_update_fn=default_structure_update_fn,
-        init_neuron_fn=make_init_neuron_fn(HiddenNeuron, connector, weight_init),
+        connectivity_init_fn=connector,
+        state_init_fn=make_default_state_init_fn(),
         compute_output_error_fn=make_default_output_error_fn(),
         output_forward_fn=make_default_forward_fn(identity),
         output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
+        output_state_init_fn=make_default_state_init_fn(
+            lambda key, shape, dtype, fan_in: jnp.zeros(shape, dtype)
+        ),
     )
 
     network = Network(
@@ -102,14 +105,13 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
 
     # Initialize each hidden layer (sequential so each sees prior layers' neurons)
     key = random.PRNGKey(args.seed)
-    for k in range(num_layers):
+    for _ in range(num_layers):
         key, layer_key = random.split(key)
-        network = network.initialize_layer(k, layer_key)
+        network = network.add_layer(n_units=hidden_dim, key=layer_key)
 
     # Connect last hidden layer to outputs
     key, out_key = random.split(key)
-    network = network.connect_to_output(
-        network.get_units_in_layer(-1), weight_init, out_key)
+    network = network.connect_to_output(network.get_units_in_layer(-1), out_key)
 
     return TrainState(network=network, rng=key, step=jnp.array(0))
 

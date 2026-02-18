@@ -205,61 +205,44 @@ def make_prior_layer_connector(
     return connector
 
 
-def make_init_neuron_fn(
-    neuron_cls: type[NeuronState],
-    connector: Callable,
-    weight_init: Callable | None = None,
+def lecun_uniform(
+    key: jax.Array,
+    shape: Tuple,
+    dtype: jnp.dtype,
+    fan_in: Int[Array, ''],
+) -> Float[Array, 'max_connections']:
+    """Lecun uniform: uniform(-limit, limit) where limit = sqrt(3 / fan_in)."""
+    limit = jnp.sqrt(3.0 / jnp.maximum(fan_in, 1))
+    return jax.random.uniform(key, shape, dtype, -limit, limit)
+
+
+def make_default_state_init_fn(
+    weight_init: Callable = lecun_uniform,
 ) -> Callable:
-    """Create an init function with pluggable connectivity and weight initialization.
+    """Create a state_init_fn that initializes weights given a neuron with connectivity set.
+
+    The returned function receives a NeuronState that already has incoming_ids,
+    active_connection_mask, and active_mask set. It initializes weights (and
+    leaves other fields at their constructor defaults).
 
     Args:
-        neuron_cls: NeuronState subclass with no-arg constructor.
-        connector: Function (connectable_mask, index, max_connections, key)
-            -> (incoming_ids, active_connection_mask).
-        weight_init: Optional initializer (key, shape, dtype) -> Array.
-            Called with shape (max_connections,). Use jax.nn.initializers.normal,
-            uniform, etc. Fan-in-based initializers like he_normal require 2D
-            shapes and won't work directly. If None, weights default to zeros.
+        weight_init: Callable (key, shape, dtype, fan_in) -> Array.
+            Defaults to lecun_uniform. fan_in is the number of active
+            incoming connections, derived from the connection mask.
 
     Returns:
-        init_neuron_fn(hidden_states, connectable_mask, index, key) -> NeuronState
+        state_init_fn(neuron_state, key) -> NeuronState
     """
-    def init_neuron_fn(
-        hidden_states: NeuronState,
-        connectable_mask: Bool[Array, 'total_neurons'],
-        index: Int[Array, ''],
+    def state_init_fn(
+        neuron_state: NeuronState,
         key: jax.Array,
     ) -> NeuronState:
-        state = neuron_cls()
-        max_conn = state.weights.shape[0]
+        fan_in = neuron_state.active_connection_mask.sum()
+        weights = weight_init(key, neuron_state.weights.shape, jnp.float32, fan_in)
+        weights = jnp.where(neuron_state.active_connection_mask, weights, 0.0)
+        return tree_replace(neuron_state, weights=weights)
 
-        conn_key, weight_key = jax.random.split(key)
-        incoming_ids, active_mask = connector(connectable_mask, index, max_conn, conn_key)
-
-        if weight_init is not None:
-            weights = weight_init(weight_key, (max_conn,), jnp.float32)
-            weights = jnp.where(active_mask, weights, 0.0)
-        else:
-            weights = jnp.zeros(max_conn)
-
-        return tree_replace(
-            state,
-            active_mask=jnp.array(True),
-            incoming_ids=incoming_ids,
-            weights=weights,
-            active_connection_mask=active_mask,
-        )
-
-    return init_neuron_fn
-
-
-def make_default_init_neuron_fn(neuron_cls: type[NeuronState]) -> Callable:
-    """Create an init function that randomly connects with zero weights.
-
-    Convenience wrapper around make_init_neuron_fn with random_connector
-    and no weight initialization.
-    """
-    return make_init_neuron_fn(neuron_cls, random_connector)
+    return state_init_fn
 
 
 # ---------------------------------------------------------------------------
