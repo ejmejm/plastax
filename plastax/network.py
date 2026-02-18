@@ -25,6 +25,7 @@ class StateUpdateFunctions(eqx.Module):
     state_init_fn: Callable = eqx.field(static=True)
     compute_output_error_fn: Callable = eqx.field(static=True)
     output_forward_fn: Callable | None = eqx.field(static=True, default=None)
+    output_backward_signal_fn: Callable | None = eqx.field(static=True, default=None)
     output_neuron_update_fn: Callable | None = eqx.field(static=True, default=None)
     output_state_init_fn: Callable | None = eqx.field(static=True, default=None)
 
@@ -620,26 +621,31 @@ class Network(eqx.Module):
             output_error,
         )
 
-        # 2. Top-down: propagate signals from each layer, then update its weights
+        # 2. Top-down: propagate error (with activation derivative) then update weights
         out_update_fn = (fns.output_neuron_update_fn
                          if fns.output_neuron_update_fn is not None
                          else fns.neuron_update_fn)
+        out_backward_fn = (fns.output_backward_signal_fn
+                           if fns.output_backward_signal_fn is not None
+                           else fns.backward_signal_fn)
 
         for layer_k in range(self.max_layers, -1, -1):
             # Get this layer's states
             if layer_k == self.max_layers:
                 current_states = output_states
+                back_fn = out_backward_fn
             else:
                 start, end = self.layer_boundaries[layer_k]
                 current_states = self._get_layer_states(hidden_states, start, end)
+                back_fn = fns.backward_signal_fn
 
-            # Propagate signals to the layer below (if one exists)
+            # Propagate error to the layer below (using original weights)
             if layer_k > 0:
                 below_start, below_end = self.layer_boundaries[layer_k - 1]
                 below_states = self._get_layer_states(hidden_states, below_start, below_end)
                 below_indices = jnp.arange(below_start, below_end) + self.n_inputs
                 updated_errors = jax.vmap(
-                    fns.backward_signal_fn, in_axes=(0, 0, None)
+                    back_fn, in_axes=(0, 0, None)
                 )(below_states, below_indices, current_states)
                 below_states = eqx.tree_at(
                     lambda s: s.error_signal, below_states, updated_errors)
@@ -650,7 +656,6 @@ class Network(eqx.Module):
             if layer_k == self.max_layers:
                 output_states = jax.vmap(out_update_fn)(output_states)
             else:
-                current_states = self._get_layer_states(hidden_states, start, end)
                 current_states = jax.vmap(fns.neuron_update_fn)(current_states)
                 hidden_states = self._set_layer_states(hidden_states, start, end, current_states)
 

@@ -173,11 +173,12 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 - [ ] Add the ability to set outgoing connections on new unit init.
 - [ ] Add tests for core functionality.
 - [ ] Add a notion of location to units, be it a layer index or an n-dimensional index to pass to connectivity init functions.
+- [ ] Change backward error signal propagation to allow for propagating more than the error signal.
 
 **Usability changes:**
 - [ ] Change the wording of defaults to clearly indicate that it is doing backprop and standard ML stuff. The word default says nothing about what they do. You can have alternative names that call them default.
 - [ ] Have typing for each of the user defined functions, and easy place to go and check what the I/O of each of those functions should be, and something that will allow for type checking.
-- [ ] Make an easy way of initializing individual units or entire layers. These should be defined mainly for individual units, but there should be a very easy way to apply to layers that uses vmapping in the backend. It should be easy to infer how they work on the backend, no magic:
+- [x] Make an easy way of initializing individual units or entire layers. These should be defined mainly for individual units, but there should be a very easy way to apply to layers that uses vmapping in the backend. It should be easy to infer how they work on the backend, no magic:
    - Connectivity mode:
       - All prior units (in all prior layers and inputs, starting from latest layer and going backwards until max input connections hit)
       - Random all prior units (randomly in all prior layers and input up to max input connections)

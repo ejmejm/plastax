@@ -84,6 +84,7 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
         state_init_fn=make_default_state_init_fn(),
         compute_output_error_fn=make_default_output_error_fn(),
         output_forward_fn=make_default_forward_fn(identity),
+        output_backward_signal_fn=make_default_backward_signal_fn(jax.grad(identity)),
         output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
         output_state_init_fn=make_default_state_init_fn(
             lambda key, shape, dtype, fan_in: jnp.zeros(shape, dtype)

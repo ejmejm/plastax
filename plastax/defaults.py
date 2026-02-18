@@ -61,11 +61,18 @@ def make_default_forward_fn(activation_fn: Callable = jax.nn.relu) -> Callable:
 # Default backward signal function
 # ---------------------------------------------------------------------------
 
-def make_default_backward_signal_fn() -> Callable:
+def make_default_backward_signal_fn(
+    activation_deriv: Callable = jax.grad(jax.nn.relu),
+) -> Callable:
     """Create a backward signal function that propagates error via outgoing connections.
 
-    For each neuron, finds which next-layer neurons connect from it and sums
-    (weight * error_signal * connection_mask) to get the incoming error.
+    For each neuron, finds which next-layer neurons connect from it and computes
+    delta_j = error_j * activation_deriv(pre_activation_j) for each sending
+    neuron j, then sums (weight * delta * connection_mask) to get the error.
+
+    Args:
+        activation_deriv: Derivative of the sending layer's activation function.
+            Called as activation_deriv(pre_activation) -> scalar.
     """
     def backward_signal_fn(
         neuron_state: NeuronState,
@@ -78,14 +85,17 @@ def make_default_backward_signal_fn() -> Callable:
         next_errors = next_layer_states.error_signal
         next_active = next_layer_states.active_mask
 
+        # Compute delta for each sending neuron: error * f'(pre_activation)
+        next_deltas = next_errors * jax.vmap(activation_deriv)(next_layer_states.pre_activation)
+
         # Find where this neuron's index appears in next layer's incoming connections
         is_match = (next_incoming == neuron_index) & next_conn_mask
 
         # For each next-layer neuron, sum the weights of connections from this neuron
         effective_weights = (next_weights * is_match).sum(axis=-1)
 
-        # Weight by the next-layer neurons' error signals and active mask
-        error_from_above = (effective_weights * next_errors * next_active).sum()
+        # Weight by deltas and active mask
+        error_from_above = (effective_weights * next_deltas * next_active).sum()
 
         return error_from_above
 
