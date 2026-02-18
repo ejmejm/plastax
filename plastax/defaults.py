@@ -1,4 +1,4 @@
-"""Default implementations of user-defined functions for standard backprop + SGD."""
+"""Standard backprop + SGD implementations of user-defined functions."""
 
 from typing import Callable, Tuple
 
@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int
 
+from plastax.network import StateUpdateFunctions
 from plastax.states import (
     NeuronState,
     StructureUpdateState,
@@ -14,10 +15,10 @@ from plastax.states import (
 
 
 # ---------------------------------------------------------------------------
-# Default NeuronState class
+# Backprop NeuronState class
 # ---------------------------------------------------------------------------
 
-class DefaultNeuronState(NeuronState):
+class BackpropNeuronState(NeuronState):
     """NeuronState with extra fields for standard backprop."""
     pre_activation: Float[Array, '']
     incoming_activations: Float[Array, 'max_connections']
@@ -29,13 +30,13 @@ class DefaultNeuronState(NeuronState):
 
 
 # ---------------------------------------------------------------------------
-# Default forward function
+# Weighted-sum forward function
 # ---------------------------------------------------------------------------
 
-def make_default_forward_fn(activation_fn: Callable = jax.nn.relu) -> Callable:
+def make_weighted_sum_forward_fn(activation_fn: Callable = jax.nn.relu) -> Callable:
     """Create a forward function that does weighted sum + activation.
 
-    Stores pre_activation and incoming_activations in DefaultNeuronState.
+    Stores pre_activation and incoming_activations in BackpropNeuronState.
     """
     def forward_fn(
         neuron_state: NeuronState,
@@ -58,10 +59,10 @@ def make_default_forward_fn(activation_fn: Callable = jax.nn.relu) -> Callable:
 
 
 # ---------------------------------------------------------------------------
-# Default backward signal function
+# Backprop error signal function
 # ---------------------------------------------------------------------------
 
-def make_default_backward_signal_fn(
+def make_backprop_error_signal_fn(
     activation_deriv: Callable = jax.grad(jax.nn.relu),
 ) -> Callable:
     """Create a backward signal function that propagates error via outgoing connections.
@@ -103,10 +104,10 @@ def make_default_backward_signal_fn(
 
 
 # ---------------------------------------------------------------------------
-# Default neuron update function
+# SGD neuron update function
 # ---------------------------------------------------------------------------
 
-def make_default_neuron_update_fn(
+def make_sgd_update_fn(
     learning_rate: float,
     activation_fn: Callable = jax.nn.relu,
 ) -> Callable:
@@ -142,10 +143,10 @@ def make_default_neuron_update_fn(
 
 
 # ---------------------------------------------------------------------------
-# Default structure update (no-op)
+# No-op structure update
 # ---------------------------------------------------------------------------
 
-def default_structure_update_fn(
+def noop_structure_update_fn(
     layer_states: NeuronState,
     next_layer_states: NeuronState,
     structure_state: StructureUpdateState,
@@ -226,7 +227,7 @@ def lecun_uniform(
     return jax.random.uniform(key, shape, dtype, -limit, limit)
 
 
-def make_default_state_init_fn(
+def make_weight_init_fn(
     weight_init: Callable = lecun_uniform,
 ) -> Callable:
     """Create a state_init_fn that initializes weights given a neuron with connectivity set.
@@ -256,10 +257,10 @@ def make_default_state_init_fn(
 
 
 # ---------------------------------------------------------------------------
-# Default output error function (MSE derivative)
+# MSE output error function
 # ---------------------------------------------------------------------------
 
-def make_default_output_error_fn() -> Callable:
+def make_mse_error_fn() -> Callable:
     """MSE derivative: 2 * (prediction - target) / n_outputs."""
     def compute_output_error(
         output_activations: Float[Array, 'n_outputs'],
@@ -269,3 +270,47 @@ def make_default_output_error_fn() -> Callable:
         return 2.0 * (output_activations - targets) / n
 
     return compute_output_error
+
+
+# ---------------------------------------------------------------------------
+# Convenience: full backprop StateUpdateFunctions
+# ---------------------------------------------------------------------------
+
+def make_backprop_sgd_update_functions(
+    connectivity_init_fn: Callable,
+    learning_rate: float = 0.01,
+    activation_fn: Callable = jax.nn.relu,
+    error_fn: Callable = make_mse_error_fn(),
+):
+    """Create a full StateUpdateFunctions for standard backprop + SGD.
+
+    Builds weighted-sum forward, backprop error propagation, SGD weight
+    updates, and linear output neurons. Output weights are zero-initialized.
+
+    Args:
+        connectivity_init_fn: Determines which neurons each new neuron
+            connects from (e.g. ``make_prior_layer_connector``).
+        learning_rate: SGD learning rate.
+        activation_fn: Hidden-layer activation (default ReLU).
+        error_fn: Output error function (activations, targets) -> errors.
+            Defaults to MSE derivative.
+
+    Returns:
+        A ``StateUpdateFunctions`` instance ready for ``Network``.
+    """
+    identity = lambda x: x
+    return StateUpdateFunctions(
+        forward_fn=make_weighted_sum_forward_fn(activation_fn),
+        backward_signal_fn=make_backprop_error_signal_fn(),
+        neuron_update_fn=make_sgd_update_fn(learning_rate, activation_fn),
+        structure_update_fn=noop_structure_update_fn,
+        connectivity_init_fn=connectivity_init_fn,
+        state_init_fn=make_weight_init_fn(),
+        compute_output_error_fn=error_fn,
+        output_forward_fn=make_weighted_sum_forward_fn(identity),
+        output_backward_signal_fn=make_backprop_error_signal_fn(jax.grad(identity)),
+        output_neuron_update_fn=make_sgd_update_fn(learning_rate, identity),
+        output_state_init_fn=make_weight_init_fn(
+            lambda key, shape, dtype, fan_in: jnp.zeros(shape, dtype)
+        ),
+    )

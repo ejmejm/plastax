@@ -1,7 +1,7 @@
 """Demo: Standard MLP with SGD on synthetic regression using plastax.
 
 Task: y = [sin(x1 + x2), cos(x1 - x2)], 2 inputs, 2 outputs.
-Uses default forward/backward/update functions from plastax.defaults.
+Uses backprop/SGD functions from plastax.defaults.
 """
 
 import argparse
@@ -12,16 +12,10 @@ import jax.numpy as jnp
 from jax import random
 
 from plastax import (
-    DefaultNeuronState,
+    BackpropNeuronState,
     Network,
-    StateUpdateFunctions,
     StructureUpdateState,
-    default_structure_update_fn,
-    make_default_backward_signal_fn,
-    make_default_forward_fn,
-    make_default_neuron_update_fn,
-    make_default_output_error_fn,
-    make_default_state_init_fn,
+    make_backprop_sgd_update_functions,
     make_prior_layer_connector,
 )
 
@@ -62,34 +56,17 @@ def init_experiment(args: argparse.Namespace) -> TrainState:
     max_hidden_conn = max(n_inputs, hidden_dim)
 
     # Neuron classes with baked-in max_connections
-    class HiddenNeuron(DefaultNeuronState):
+    class HiddenNeuron(BackpropNeuronState):
         def __init__(self):
             super().__init__(max_connections=max_hidden_conn)
 
-    class OutputNeuron(DefaultNeuronState):
+    class OutputNeuron(BackpropNeuronState):
         def __init__(self):
             super().__init__(max_connections=hidden_dim)
 
     # State update functions (ReLU hidden, linear output, SGD weight updates)
-    lr = args.learning_rate
-    identity = lambda x: x
     connector = make_prior_layer_connector(n_inputs, hidden_dim)
-
-    fns = StateUpdateFunctions(
-        forward_fn=make_default_forward_fn(jax.nn.relu),
-        backward_signal_fn=make_default_backward_signal_fn(),
-        neuron_update_fn=make_default_neuron_update_fn(lr, jax.nn.relu),
-        structure_update_fn=default_structure_update_fn,
-        connectivity_init_fn=connector,
-        state_init_fn=make_default_state_init_fn(),
-        compute_output_error_fn=make_default_output_error_fn(),
-        output_forward_fn=make_default_forward_fn(identity),
-        output_backward_signal_fn=make_default_backward_signal_fn(jax.grad(identity)),
-        output_neuron_update_fn=make_default_neuron_update_fn(lr, identity),
-        output_state_init_fn=make_default_state_init_fn(
-            lambda key, shape, dtype, fan_in: jnp.zeros(shape, dtype)
-        ),
-    )
+    fns = make_backprop_sgd_update_functions(connector, learning_rate=args.learning_rate)
 
     network = Network(
         n_inputs=n_inputs,

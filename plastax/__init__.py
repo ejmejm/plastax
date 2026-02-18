@@ -8,14 +8,15 @@ from plastax.network import (
     StateUpdateFunctions,
 )
 from plastax.defaults import (
-    DefaultNeuronState,
-    default_structure_update_fn,
-    make_default_backward_signal_fn,
-    make_default_forward_fn,
-    make_default_neuron_update_fn,
-    make_default_output_error_fn,
+    BackpropNeuronState,
     lecun_uniform,
-    make_default_state_init_fn,
+    make_backprop_error_signal_fn,
+    make_backprop_sgd_update_functions,
+    make_mse_error_fn,
     make_prior_layer_connector,
+    make_sgd_update_fn,
+    make_weight_init_fn,
+    make_weighted_sum_forward_fn,
+    noop_structure_update_fn,
     random_connector,
 )

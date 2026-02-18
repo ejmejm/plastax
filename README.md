@@ -169,15 +169,19 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 ### TODO
 
 **Core functional changes:**
-- [ ] Add pipelined version of the model, which entails making a parent class with everything except for the framework-defined transition functions, then having different children classes that implement those differently for global and pipelined computation.
-- [ ] Add the ability to set outgoing connections on new unit init.
 - [ ] Add tests for core functionality.
-- [ ] Add a notion of location to units, be it a layer index or an n-dimensional index to pass to connectivity init functions.
+- [ ] Add the ability to set outgoing connections on new unit init.
 - [ ] Change backward error signal propagation to allow for propagating more than the error signal.
+- [ ] Add pipelined version of the model, which entails making a parent class with everything except for the framework-defined transition functions, then having different children classes that implement those differently for global and pipelined computation.
+- [ ] Add a notion of location to units, be it a layer index or an n-dimensional index to pass to connectivity init functions.
 
 **Usability changes:**
 - [ ] Change the wording of defaults to clearly indicate that it is doing backprop and standard ML stuff. The word default says nothing about what they do. You can have alternative names that call them default.
 - [ ] Have typing for each of the user defined functions, and easy place to go and check what the I/O of each of those functions should be, and something that will allow for type checking.
+- [ ] Add examples of different algorithms
+   - [ ] SGD (done but need to simplify)
+   - [ ] Autostep output layer + SGD elsewhere
+   - [ ] Continual backprop
 - [x] Make an easy way of initializing individual units or entire layers. These should be defined mainly for individual units, but there should be a very easy way to apply to layers that uses vmapping in the backend. It should be easy to infer how they work on the backend, no magic:
    - Connectivity mode:
       - All prior units (in all prior layers and inputs, starting from latest layer and going backwards until max input connections hit)
@@ -189,10 +193,6 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
       - Xavier
       - Lecun normal/uniform
       - Kaiming normal/uniform
-- [ ] Add examples of different algorithms
-   - [ ] SGD (done but need to simplify)
-   - [ ] Autostep output layer + SGD elsewhere
-   - [ ] Continual backprop
 
 **Efficiency changes:**
 - [ ] Have an option of running the structural change step only once every `n` steps. For this to be jittable without a jax.lax.cond, there will need to be a new step function that actually scans over n steps without the structural change, then does the structural change at the end. The user won't be able to call this function for just 1 step, but that is the price for being able to do this without conditionals. The original step function should still remain, this would just be a second preferred option.
