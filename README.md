@@ -162,12 +162,8 @@ Methods on `Network` for manually modifying structure:
 ## Running the Demo
 
 ```bash
-pip install -e ".[demo]"
-
+pip install -e .
 python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
-
-# With MLflow logging
-python demo.py --seed 42 --num_steps 50000 --mlflow
 ```
 
 ### TODO

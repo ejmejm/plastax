@@ -8,8 +8,6 @@ dependencies = [
     "jaxtyping>=0.2.0",
 ]
 
-[project.optional-dependencies]
-demo = ["mlflow", "tqdm", "numpy"]
 
 [build-system]
 requires = ["setuptools>=61.0"]
