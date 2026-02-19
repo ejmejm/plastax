@@ -5,6 +5,7 @@ Uses backprop/SGD functions from plastax.standard.
 """
 
 import argparse
+import time
 
 import equinox as eqx
 import jax
@@ -127,8 +128,12 @@ def train_block(state: TrainState):
 
 def train(state: TrainState, num_steps: int) -> TrainState:
     for _ in range(num_steps // LOG_INTERVAL):
-        state, losses = train_block(state)
-        print(f"Step {int(state.step):>6d} | Loss: {float(losses.mean()):.6f}")
+        block_start = time.time()
+        state, losses = jax.block_until_ready(train_block(state))
+        block_elapsed = time.time() - block_start
+        print(f"Block elapsed: {block_elapsed:.2f} seconds")
+        steps_per_sec = LOG_INTERVAL / block_elapsed
+        print(f"Step {int(state.step):>6d} | Loss: {float(losses.mean()):.6f} | {steps_per_sec:.1f} steps/sec")
     return state
 
 
