@@ -169,7 +169,7 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 ### TODO
 
 **Core functional changes:**
-- [ ] Add tests for core functionality.
+- [x] Add tests for core functionality.
 - [ ] Add the ability to set outgoing connections on new unit init.
 - [ ] Change backward error signal propagation to allow for propagating more than the error signal.
 - [ ] Add pipelined version of the model, which entails making a parent class with everything except for the framework-defined transition functions, then having different children classes that implement those differently for global and pipelined computation.
@@ -179,9 +179,11 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 - [ ] Change the wording of defaults to clearly indicate that it is doing backprop and standard ML stuff. The word default says nothing about what they do. You can have alternative names that call them default.
 - [ ] Have typing for each of the user defined functions, and easy place to go and check what the I/O of each of those functions should be, and something that will allow for type checking.
 - [ ] Add examples of different algorithms
-   - [ ] SGD (done but need to simplify)
+   - [x] SGD (done but need to simplify)
    - [ ] Autostep output layer + SGD elsewhere
    - [ ] Continual backprop
+   - [ ] Cascade correlation
+   - [ ] Equillibrium propagation
 - [x] Make an easy way of initializing individual units or entire layers. These should be defined mainly for individual units, but there should be a very easy way to apply to layers that uses vmapping in the backend. It should be easy to infer how they work on the backend, no magic:
    - Connectivity mode:
       - All prior units (in all prior layers and inputs, starting from latest layer and going backwards until max input connections hit)
@@ -193,7 +195,13 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
       - Xavier
       - Lecun normal/uniform
       - Kaiming normal/uniform
+- [ ] Rename max_layers to max_hidden_layers
 
 **Efficiency changes:**
 - [ ] Have an option of running the structural change step only once every `n` steps. For this to be jittable without a jax.lax.cond, there will need to be a new step function that actually scans over n steps without the structural change, then does the structural change at the end. The user won't be able to call this function for just 1 step, but that is the price for being able to do this without conditionals. The original step function should still remain, this would just be a second preferred option.
 - [ ] Continue allowing users to make individual structural changes, but put them in a buffer until `step` or a new `apply_structure_changes` function is called so that they can be parallelized.
+
+
+### Existing Problems
+- Not being able to connect units outgoing connections on creation means continual backprop is not possible within the loop.
+- There is no way to have global information, which makes it hard in cascade correlation to know when the network is in a hidden unit frozen state or not (which is a global state). This could be fixed by allowing the use to have a custom global state in addition to a custom NeuronState, and having an optional function that updates the global state at the end of each step.
