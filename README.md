@@ -44,7 +44,6 @@ Hidden and output neurons are stored separately because output neurons may use a
 - `active_mask`: whether this neuron is active
 - `incoming_ids`: indices of source neurons in the flat index space
 - `weights`: connection weights
-- `active_connection_mask`: which incoming connections are active
 - `activation_value`: the neuron's output
 - `error_signal`: gradient/error signal
 
@@ -205,3 +204,5 @@ python demo.py --seed 42 --num_steps 50000 --hidden_dim 32 --learning_rate 0.01
 ### Existing Problems
 - Not being able to connect units outgoing connections on creation means continual backprop is not possible within the loop.
 - There is no way to have global information, which makes it hard in cascade correlation to know when the network is in a hidden unit frozen state or not (which is a global state). This could be fixed by allowing the use to have a custom global state in addition to a custom NeuronState, and having an optional function that updates the global state at the end of each step.
+- The auto_connect_to_output is weird. It applied to inputs and automatically generated units, but not manually created units. There should be a function for connecting inputs to outputs at the start, but all other connections to the output should be handled via an output connection ids parameter.
+- Should the state update functions be internal to the neuron? Could have an overarching class that defines transition functions and state. That would make for a cleaner separation between output and hidden state transition functions. It would also then make it easier to have an arbitrary number of different neuron types in the same network.

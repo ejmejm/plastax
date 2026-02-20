@@ -1,3 +1,4 @@
+import random
 from typing import Callable, Tuple
 
 import equinox as eqx
@@ -10,6 +11,9 @@ from plastax.states import (
     StructureUpdateState,
     tree_replace,
 )
+
+
+CONNECTION_PADDING = -1
 
 
 # ---------------------------------------------------------------------------
@@ -67,18 +71,36 @@ class Network(eqx.Module):
         hidden_neuron_cls: type[NeuronState],
         state_update_fns: StateUpdateFunctions,
         structure_state: StructureUpdateState,
-        output_neuron_cls: type[NeuronState] = None,
+        output_neuron_cls: type[NeuronState] | None = None,
         max_generate_per_step: int = 0,
         auto_connect_to_output: bool = False,
+        key: PRNGKeyArray | None = None,
     ):
         """Create a Network with all hidden neurons inactive.
+        
+        Uses the given NeuronState classes (or subclasses) to construct the initial state arrays.
+        max_connections and max_output_connections are derived from the constructed neurons' weight shapes.
+        Output neurons are activated. If auto_connect_to_output is False, the network will start with no
+        connections, and the outputs will be zero until connections are made.
 
-        Uses the given NeuronState classes (or subclasses) to construct the
-        initial state arrays.  max_connections and max_output_connections are
-        derived from the constructed neurons' weight shapes.  Output neurons
-        are activated.  If auto_connect_to_output is True, outputs are wired
-        to receive from all input units (with zero weights).
+        Args:
+            n_inputs (int): Number of input neurons.
+            n_outputs (int): Number of output neurons.
+            max_hidden_per_layer (int): Maximum number of hidden neurons per layer.
+            max_layers (int): Maximum number of hidden layers.
+            hidden_neuron_cls (type[NeuronState]): Class or subclass to use for hidden neurons.
+            state_update_fns (StateUpdateFunctions): Group of state update functionals for dynamics/structure/plasticity.
+            structure_state (StructureUpdateState): Initial structure state for the network.
+            output_neuron_cls (type[NeuronState] | None, optional): Class or subclass to use for output neurons.
+                If None, uses hidden_neuron_cls. Defaults to None.
+            max_generate_per_step (int, optional): Maximum number of new neurons to add per step. Defaults to 0.
+            auto_connect_to_output (bool, optional): If True, connect all input units and newly created hidden units
+                to all output neurons (with initial weight values of zero). Defaults to False.
+            key (PRNGKeyArray | None, optional): PRNG key for initial randomization. If None, a random seed is created. Defaults to None.
         """
+        if key is None:
+            key = jax.random.PRNGKey(random.randint(0, 2**31 - 1))
+        
         self.n_inputs = n_inputs
         self.n_outputs = n_outputs
         self.max_hidden_per_layer = max_hidden_per_layer
@@ -115,19 +137,16 @@ class Network(eqx.Module):
             jnp.ones(n_outputs, dtype=bool),
         )
 
-        # Optionally connect output neurons to input neurons
-        if auto_connect_to_output:
-            input_ids = jnp.arange(n_inputs, dtype=jnp.int32)
-            output_states = tree_replace(
-                output_states,
-                incoming_ids=output_states.incoming_ids.at[:, :n_inputs].set(input_ids),
-                weights=output_states.weights.at[:, :n_inputs].set(0.0),
-                active_connection_mask=output_states.active_connection_mask.at[:, :n_inputs].set(True),
-            )
-
         self.hidden_states = hidden_states
         self.output_states = output_states
         self.structure_state = structure_state
+
+        # Optionally connect output neurons to input neurons
+        if auto_connect_to_output:
+            key, auto_connect_key = jax.random.split(key)
+            input_ids = jnp.arange(n_inputs, dtype=jnp.int32)
+            updated_network = self.connect_to_output(input_ids, auto_connect_key)
+            self.output_states = updated_network.output_states
 
     # -----------------------------------------------------------------------
     # Public API
@@ -330,12 +349,21 @@ class Network(eqx.Module):
             incoming_ids: Absolute indices of source neurons, padded with -1
                 for inactive connection slots.
             key: PRNG key for state initialization.
-            connect_to_output: If True, also connect the new neuron to all outputs.
+            connect_to_output: Whether to connect the new neuron to all output neurons.
 
         Returns the updated network and a boolean indicating success (False if
         the target layer had no inactive slots).
         """
         state_key, auto_connect_key = jax.random.split(key)
+        
+        # Requires recompiling for different shapes, so liberal use of different shapes should be avoided
+        if incoming_ids.shape[0] < self.max_connections:
+            incoming_ids = jnp.concatenate([
+                incoming_ids,
+                jnp.full((self.max_connections - incoming_ids.shape[0],), CONNECTION_PADDING),
+            ])
+        elif incoming_ids.shape[0] > self.max_connections:
+            raise ValueError(f"There are more incoming IDS ({(incoming_ids.shape[0])}) than max connection slots ({self.max_connections})")
 
         # Derive connectivity
         active_connection_mask = incoming_ids >= 0

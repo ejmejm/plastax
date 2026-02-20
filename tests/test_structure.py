@@ -4,6 +4,7 @@ connect_to_output, add_layer, generation, and pruning.
 All tests verify structural changes through observable forward-pass output.
 """
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 from jaxtyping import PRNGKeyArray
@@ -17,6 +18,51 @@ from conftest import (
     forward_output,
     make_forward_only_fns,
 )
+
+
+# ---------------------------------------------------------------------------
+# auto_connect_to_output on init
+# ---------------------------------------------------------------------------
+
+def test_auto_connect_to_output_on_init(key: PRNGKeyArray):
+    """At init, auto_connect_to_output=True wires outputs to all inputs with
+    init weights; output is the weighted sum. When False, output has no
+    connections so output is 0. Test asserts outcome only (output values)."""
+    fns = make_forward_only_fns(state_init_fn=constant_weight_init(1.0))
+    inputs = jnp.array([2.0, 3.0])
+    key, k_true, k_false = jax.random.split(key, 3)
+
+    net_true = Network(
+        n_inputs=2,
+        n_outputs=1,
+        max_hidden_per_layer=4,
+        max_layers=2,
+        hidden_neuron_cls=SmallHiddenNeuron,
+        output_neuron_cls=SmallOutputNeuron,
+        state_update_fns=fns,
+        structure_state=StructureUpdateState(),
+        auto_connect_to_output=True,
+        key=k_true,
+    )
+    out_true = forward_output(net_true, inputs, k_true)
+    # Hand-calc: output connected to input0 and input1 with weight 1.0 each
+    # → output = 1.0*2 + 1.0*3 = 5.0
+    assert jnp.allclose(out_true, jnp.array([5.0]), atol=1e-5)
+
+    net_false = Network(
+        n_inputs=2,
+        n_outputs=1,
+        max_hidden_per_layer=4,
+        max_layers=2,
+        hidden_neuron_cls=SmallHiddenNeuron,
+        output_neuron_cls=SmallOutputNeuron,
+        state_update_fns=fns,
+        structure_state=StructureUpdateState(),
+        auto_connect_to_output=False,
+        key=k_false,
+    )
+    out_false = forward_output(net_false, inputs, k_false)
+    assert jnp.allclose(out_false, jnp.array([0.0]), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +343,7 @@ def test_generation_adds_neuron(key: PRNGKeyArray):
     net = Network(
         n_inputs=2,
         n_outputs=1,
-        max_hidden_per_layer=4,
+        max_hidden_per_layer=2,
         max_layers=1,
         hidden_neuron_cls=SmallHiddenNeuron,
         output_neuron_cls=SmallOutputNeuron,
@@ -307,21 +353,25 @@ def test_generation_adds_neuron(key: PRNGKeyArray):
         auto_connect_to_output=True,
     )
 
-    # No hidden neurons yet, output should be 0
-    key, kf1, k_step, kf2 = jax.random.split(key, 4)
-    out_before = forward_output(net, jnp.array([2.0, 3.0]), kf1)
-    assert jnp.allclose(out_before, jnp.array([0.0]), atol=1e-5)
+    # No hidden neurons yet, output should be sum of inputs
+    kf1, kf2, kf3, kf4 = jax.random.split(key, 4)
+    targets = jnp.zeros(net.n_outputs)
+    inputs = jnp.array([2.0, 3.0])
 
-    # Step triggers generation (forward/backward are no-ops for values, but
-    # structure_update generates 1 neuron)
-    net = net.step(jnp.array([2.0, 3.0]), jnp.array([0.0]), k_step)
+    net = net.step(inputs, targets, kf1)
+    assert jnp.allclose(net.output_states.activation_value, jnp.array([5.0]), atol=1e-5)
 
-    # Now one hidden neuron exists with weight 0.5 on each input.
-    # hidden = 0.5*2 + 0.5*3 = 2.5
-    # auto-connect weight to output = 1.0 (from output_state_init_fn)
-    # output = 1.0 * 2.5 = 2.5
-    out_after = forward_output(net, jnp.array([2.0, 3.0]), kf2)
-    assert jnp.allclose(out_after, jnp.array([2.5]), atol=1e-5)
+    # There should have been one hidden unit added after the last forward pass
+    net = net.step(inputs, targets, kf2)
+    assert jnp.allclose(net.output_states.activation_value, jnp.array([7.5]), atol=1e-5)
+
+    # After one more generation there should be two hidden units, both in the same layer
+    net = net.step(inputs, targets, kf3)
+    assert jnp.allclose(net.output_states.activation_value, jnp.array([10.0]), atol=1e-5)
+
+    # The maximum number of hidden units is 2, so no more hidden units should have been added
+    net = net.step(inputs, targets, kf4)
+    assert jnp.allclose(net.output_states.activation_value, jnp.array([10.0]), atol=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -374,8 +424,7 @@ def _prune_all_generate_one(layer_states, next_layer_states, structure_state):
 
 
 def test_prune_then_generate_reuses_slot(key: PRNGKeyArray):
-    """After pruning, a newly generated neuron gets fresh weights, not the old
-    ones."""
+    """After pruning, a newly generated neuron gets fresh weights, not the old ones."""
     fns = make_forward_only_fns(
         state_init_fn=constant_weight_init(0.5),
         output_state_init_fn=constant_weight_init(1.0),
@@ -398,27 +447,25 @@ def test_prune_then_generate_reuses_slot(key: PRNGKeyArray):
     # Seed with a neuron that has weight=1.0 via add_unit (uses the fns'
     # state_init_fn which is constant 0.5, but we override the weights manually)
     key, k1, kf1, k_step, kf2 = jax.random.split(key, 5)
-    incoming = jnp.array([0, 1, -1, -1], dtype=jnp.int32)
-    net, _ = net.add_unit(incoming, k1, connect_to_output=True)
+    incoming_ids = jnp.array([0, 1], dtype=jnp.int32)
+    net, success = net.add_unit(incoming_ids, k1, connect_to_output=True)
+    
+    assert success, "Failed to add unit"
 
     # Manually set this neuron's weights to 1.0 so we can distinguish old from new
-    net = tree_replace(
+    net = eqx.tree_at(
+        lambda n: n.hidden_states.weights,
         net,
-        hidden_states=tree_replace(
-            net.hidden_states,
-            weights=net.hidden_states.weights.at[0].set(
-                jnp.where(net.hidden_states.active_connection_mask[0], 1.0, 0.0)
-            ),
-        ),
+        net.hidden_states.weights.at[0].set(1.0),
     )
 
-    # With weight=1.0: output = 1*2 + 1*3 = 5
+    # With weight=1.0: inputs contribute 5, hidden unit contributes 5, output = 10
     out_old = forward_output(net, jnp.array([2.0, 3.0]), kf1)
-    assert jnp.allclose(out_old, jnp.array([5.0]), atol=1e-5)
+    assert jnp.allclose(out_old, jnp.array([10.0]), atol=1e-5)
 
     # Step: prunes old neuron, generates new one with weight=0.5
     net = net.step(jnp.array([2.0, 3.0]), jnp.array([0.0]), k_step)
 
-    # New neuron: hidden = 0.5*2 + 0.5*3 = 2.5, output = 1.0*2.5 = 2.5
+    # With weight=0.5: inputs contribute 5, hidden unit contributes 2.5, output = 7.5
     out_new = forward_output(net, jnp.array([2.0, 3.0]), kf2)
-    assert jnp.allclose(out_new, jnp.array([2.5]), atol=1e-5)
+    assert jnp.allclose(out_new, jnp.array([7.5]), atol=1e-5)
