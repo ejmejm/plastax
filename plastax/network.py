@@ -7,13 +7,11 @@ import jax.numpy as jnp
 from jaxtyping import Array, Bool, Float, Int, PRNGKeyArray
 
 from plastax.states import (
+    CONNECTION_PADDING,
     NeuronState,
     StructureUpdateState,
     tree_replace,
 )
-
-
-CONNECTION_PADDING = -1
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +228,7 @@ class Network(eqx.Module):
         auto_connect_key = keys[2 * n_units]
 
         # Determine connectivity
-        incoming_ids, active_conn_masks = jax.vmap(
+        incoming_ids = jax.vmap(
             fns.connectivity_init_fn, in_axes=(None, 0, None, 0)
         )(connectable_mask, abs_indices, self.max_connections, conn_keys)
 
@@ -240,7 +238,6 @@ class Network(eqx.Module):
             blanks,
             active_mask=jnp.ones(n_units, dtype=bool),
             incoming_ids=incoming_ids,
-            active_connection_mask=active_conn_masks,
         )
         neuron_states = jax.vmap(fns.state_init_fn)(blanks, state_keys)
 
@@ -292,25 +289,24 @@ class Network(eqx.Module):
         """
         n_from = from_indices.shape[0]
         output_states = self.output_states
+        active_connection_mask = output_states.get_active_connection_mask()
 
         # For each output neuron, find n_from inactive slots via argsort
-        sorted_indices = jnp.argsort(
-            output_states.active_connection_mask.astype(jnp.int32), axis=1)
+        sorted_indices = jnp.argsort(active_connection_mask.astype(jnp.int32), axis=1)
         slots = sorted_indices[:, :n_from]
 
         out_idx = jnp.arange(self.n_outputs)[:, None]
-        has_slot = ~output_states.active_connection_mask[out_idx, slots]
+        has_slot = ~active_connection_mask[out_idx, slots]
 
         # Set incoming IDs and connection mask
-        new_ids = jnp.where(has_slot, from_indices[None, :],
-                            output_states.incoming_ids[out_idx, slots])
-        new_mask = jnp.where(has_slot, True,
-                             output_states.active_connection_mask[out_idx, slots])
+        new_ids = jnp.where(
+            has_slot, from_indices[None, :],
+            output_states.incoming_ids[out_idx, slots],
+        )
 
         output_states = tree_replace(
             output_states,
             incoming_ids=output_states.incoming_ids.at[out_idx, slots].set(new_ids),
-            active_connection_mask=output_states.active_connection_mask.at[out_idx, slots].set(new_mask),
         )
 
         # Initialize weights via state_init_fn
@@ -363,24 +359,19 @@ class Network(eqx.Module):
                 jnp.full((self.max_connections - incoming_ids.shape[0],), CONNECTION_PADDING),
             ])
         elif incoming_ids.shape[0] > self.max_connections:
-            raise ValueError(f"There are more incoming IDS ({(incoming_ids.shape[0])}) than max connection slots ({self.max_connections})")
-
-        # Derive connectivity
-        active_connection_mask = incoming_ids >= 0
-        safe_ids = jnp.where(active_connection_mask, incoming_ids, 0)
+            raise ValueError(f"There are more incoming IDs ({(incoming_ids.shape[0])}) than max connection slots ({self.max_connections})")
 
         # Create blank neuron, set connectivity, init state
         blank = self.hidden_neuron_cls()
         neuron_state = tree_replace(
             blank,
             active_mask=jnp.array(True),
-            incoming_ids=safe_ids,
-            active_connection_mask=active_connection_mask,
+            incoming_ids=incoming_ids,
         )
         neuron_state = self.state_update_fns.state_init_fn(neuron_state, state_key)
 
         # Determine target layer from max active incoming ID
-        active_ids = jnp.where(active_connection_mask, incoming_ids, -1)
+        active_ids = jnp.where(incoming_ids != CONNECTION_PADDING, incoming_ids, -1)
         max_id = jnp.max(active_ids)
 
         layer_idx = jnp.where(
@@ -429,11 +420,17 @@ class Network(eqx.Module):
 
         Returns (updated_network, success_mask).
         """
-        n_units = incoming_ids_batch.shape[0]
-        active_masks = incoming_ids_batch >= 0
-        safe_ids = jnp.where(active_masks, incoming_ids_batch, 0)
-
+        # Requires recompiling for different shapes, so liberal use of different shapes should be avoided
+        if incoming_ids_batch.shape[1] < self.max_connections:
+            incoming_ids_batch = jnp.concatenate([
+                incoming_ids_batch,
+                jnp.full((incoming_ids_batch.shape[0], self.max_connections - incoming_ids_batch.shape[1]), CONNECTION_PADDING),
+            ])
+        elif incoming_ids_batch.shape[1] > self.max_connections:
+            raise ValueError(f"There are more incoming IDs ({(incoming_ids_batch.shape[1])}) than max connection slots ({self.max_connections})")
+        
         # Split keys
+        n_units = incoming_ids_batch.shape[0]
         keys = jax.random.split(key, n_units + 1)
         state_keys = keys[:n_units]
         auto_connect_key = keys[n_units]
@@ -443,13 +440,12 @@ class Network(eqx.Module):
         neuron_states = tree_replace(
             blanks,
             active_mask=jnp.ones(n_units, dtype=bool),
-            incoming_ids=safe_ids,
-            active_connection_mask=active_masks,
+            incoming_ids=incoming_ids_batch,
         )
         neuron_states = jax.vmap(self.state_update_fns.state_init_fn)(neuron_states, state_keys)
 
         # Infer target layer from global max incoming ID
-        all_active_ids = jnp.where(active_masks, incoming_ids_batch, -1)
+        all_active_ids = jnp.where(incoming_ids_batch != CONNECTION_PADDING, incoming_ids_batch, -1)
         max_id = jnp.max(all_active_ids)
         layer_idx = jnp.where(
             max_id < self.n_inputs, 0,
@@ -504,15 +500,15 @@ class Network(eqx.Module):
         # Deactivate connections pointing to this neuron in hidden layers
         hidden_match = hidden_states.incoming_ids == neuron_abs_idx
         hidden_states = eqx.tree_at(
-            lambda s: s.active_connection_mask, hidden_states,
-            jnp.where(hidden_match, False, hidden_states.active_connection_mask),
+            lambda s: s.incoming_ids, hidden_states,
+            jnp.where(hidden_match, CONNECTION_PADDING, hidden_states.incoming_ids),
         )
 
         # Deactivate connections pointing to this neuron in output layer
         output_match = output_states.incoming_ids == neuron_abs_idx
         output_states = eqx.tree_at(
-            lambda s: s.active_connection_mask, output_states,
-            jnp.where(output_match, False, output_states.active_connection_mask),
+            lambda s: s.incoming_ids, output_states,
+            jnp.where(output_match, CONNECTION_PADDING, output_states.incoming_ids),
         )
 
         return tree_replace(self, hidden_states=hidden_states, output_states=output_states)
@@ -731,7 +727,7 @@ class Network(eqx.Module):
         state_keys = split_keys[:, 1]
 
         # Step 1: Determine connectivity
-        incoming_ids, active_conn_masks = jax.vmap(
+        incoming_ids = jax.vmap(
             fns.connectivity_init_fn, in_axes=(None, 0, None, 0)
         )(connectable_mask, abs_indices, self.max_connections, conn_keys)
 
@@ -741,7 +737,6 @@ class Network(eqx.Module):
             blanks,
             active_mask=jnp.ones(n_gen, dtype=bool),
             incoming_ids=incoming_ids,
-            active_connection_mask=active_conn_masks,
         )
 
         # Step 3: Initialize state (weights, etc.)
@@ -821,19 +816,19 @@ class Network(eqx.Module):
     ) -> Tuple[NeuronState, Bool[Array, ''], Int[Array, '']]:
         """Add a connection to a neuron in the given state array.
 
-        Only sets connectivity (incoming_ids, active_connection_mask).
+        Only sets connectivity (incoming_ids).
         Weight initialization is the caller's responsibility via state_init_fn.
 
         Returns (updated_states, success, slot_index).
         """
-        conn_mask = neuron_states.active_connection_mask[to_idx]
+        to_neuron_state = jax.tree.map(lambda x: x[to_idx], neuron_states)
+        conn_mask = to_neuron_state.get_active_connection_mask()
         slot = jnp.argmin(conn_mask)
         has_slot = ~conn_mask[slot]
 
         updated = tree_replace(
             neuron_states,
             incoming_ids=neuron_states.incoming_ids.at[to_idx, slot].set(from_idx),
-            active_connection_mask=neuron_states.active_connection_mask.at[to_idx, slot].set(True),
         )
         result = jax.tree.map(
             lambda u, o: jnp.where(has_slot, u, o),
@@ -849,9 +844,9 @@ class Network(eqx.Module):
     ) -> NeuronState:
         """Deactivate a connection at the given slot of a neuron."""
         return eqx.tree_at(
-            lambda s: s.active_connection_mask, neuron_states,
-            neuron_states.active_connection_mask.at[
-                neuron_idx, connection_slot].set(False),
+            lambda s: s.incoming_ids, neuron_states,
+            neuron_states.incoming_ids.at[
+                neuron_idx, connection_slot].set(CONNECTION_PADDING),
         )
 
     @staticmethod
@@ -890,18 +885,16 @@ class Network(eqx.Module):
         pruned_abs = jnp.where(prune_mask, abs_indices, -1)
 
         hidden_incoming = hidden_states.incoming_ids
-        hidden_conn_mask = hidden_states.active_connection_mask
         is_pruned_hidden = jnp.isin(hidden_incoming, pruned_abs)
-        hidden_conn_mask = jnp.where(is_pruned_hidden, False, hidden_conn_mask)
+        new_incoming_ids = jnp.where(is_pruned_hidden, CONNECTION_PADDING, hidden_incoming)
         hidden_states = eqx.tree_at(
-            lambda s: s.active_connection_mask, hidden_states, hidden_conn_mask)
+            lambda s: s.incoming_ids, hidden_states, new_incoming_ids)
 
         output_incoming = output_states.incoming_ids
-        output_conn_mask = output_states.active_connection_mask
         is_pruned_output = jnp.isin(output_incoming, pruned_abs)
-        output_conn_mask = jnp.where(is_pruned_output, False, output_conn_mask)
+        new_incoming_ids = jnp.where(is_pruned_output, CONNECTION_PADDING, output_incoming)
         output_states = eqx.tree_at(
-            lambda s: s.active_connection_mask, output_states, output_conn_mask)
+            lambda s: s.incoming_ids, output_states, new_incoming_ids)
 
         return hidden_states, output_states
 
@@ -919,33 +912,31 @@ class Network(eqx.Module):
         new connections via output_state_init_fn (or state_init_fn).
         """
         n = neuron_abs_indices.shape[0]
+        outputs_active_connection_mask = output_states.get_active_connection_mask()
 
         # For each output neuron, find n inactive slots via argsort
         sorted_indices = jnp.argsort(
-            output_states.active_connection_mask.astype(jnp.int32), axis=1)
+            outputs_active_connection_mask.astype(jnp.int32), axis=1)
         slots = sorted_indices[:, :n]
 
         # Check which slots are actually inactive
-        out_idx = jnp.arange(output_states.active_connection_mask.shape[0])[:, None]
-        has_slot = ~output_states.active_connection_mask[out_idx, slots]
+        out_idx = jnp.arange(outputs_active_connection_mask.shape[0])[:, None]
+        has_slot = ~outputs_active_connection_mask[out_idx, slots]
         do_connect = has_slot & should_connect[None, :]
 
         # Build updated values, keeping originals where we shouldn't connect
         existing_ids = output_states.incoming_ids[out_idx, slots]
         new_ids = jnp.where(do_connect, neuron_abs_indices[None, :], existing_ids)
-        existing_mask = output_states.active_connection_mask[out_idx, slots]
-        new_mask = jnp.where(do_connect, True, existing_mask)
 
         # Set connectivity first
         output_states = tree_replace(
             output_states,
             incoming_ids=output_states.incoming_ids.at[out_idx, slots].set(new_ids),
-            active_connection_mask=output_states.active_connection_mask.at[out_idx, slots].set(new_mask),
         )
-
+        
         # Initialize weights for new connections via state_init_fn
         init_fn = self._get_output_state_init_fn()
-        n_outputs = output_states.active_connection_mask.shape[0]
+        n_outputs = output_states.incoming_ids.shape[0]
         keys = jax.random.split(key, n_outputs)
         initialized = jax.vmap(init_fn)(output_states, keys)
 

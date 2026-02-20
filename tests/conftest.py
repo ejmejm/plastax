@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import pytest
 
 from plastax import (
+    CONNECTION_PADDING,
     BackpropNeuronState,
     Network,
     StateUpdateFunctions,
@@ -40,7 +41,7 @@ class SmallOutputNeuron(BackpropNeuronState):
 def constant_weight_init(value=1.0):
     """Return a state_init_fn that sets all active weights to *value*."""
     def state_init_fn(neuron_state, key):
-        weights = jnp.where(neuron_state.active_connection_mask, value, 0.0)
+        weights = jnp.where(neuron_state.get_active_connection_mask(), value, 0.0)
         return tree_replace(neuron_state, weights=weights)
     return state_init_fn
 
@@ -51,7 +52,7 @@ def deterministic_connector(connectable_mask, index, max_connections, key):
     sort_key = jnp.where(connectable_mask, 0, 1)
     sorted_indices = indices[jnp.argsort(sort_key, stable=True)][:max_connections]
     active = connectable_mask[sorted_indices]
-    return jnp.where(active, sorted_indices, 0), active
+    return jnp.where(active, sorted_indices, CONNECTION_PADDING)
 
 
 def noop_backward_signal_fn(neuron_state, neuron_index, next_layer_states):
@@ -119,7 +120,7 @@ def extract_weight_matrix(neuron_states, n_sources, n_neurons):
     W = jnp.zeros((n_neurons, n_sources))
     ids = neuron_states.incoming_ids[:n_neurons]
     weights = neuron_states.weights[:n_neurons]
-    mask = neuron_states.active_connection_mask[:n_neurons]
+    mask = neuron_states.get_active_connection_mask()[:n_neurons]
     for i in range(n_neurons):
         for s in range(ids.shape[1]):
             if mask[i, s]:

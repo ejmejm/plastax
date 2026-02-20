@@ -74,7 +74,7 @@ def test_relu_forward_pass(key):
         output_states=tree_replace(
             net.output_states,
             weights=net.output_states.weights.at[0].set(
-                jnp.where(net.output_states.active_connection_mask[0], 2.0, 0.0)),
+                jnp.where(net.output_states.get_active_connection_mask()[0], 2.0, 0.0)),
         ),
     )
 

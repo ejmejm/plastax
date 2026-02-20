@@ -8,6 +8,7 @@ from jaxtyping import Array, Bool, Float, Int
 
 from plastax.network import StateUpdateFunctions
 from plastax.states import (
+    CONNECTION_PADDING,
     NeuronState,
     StructureUpdateState,
     tree_replace,
@@ -43,7 +44,7 @@ def make_weighted_sum_forward_fn(activation_fn: Callable = jax.nn.relu) -> Calla
         incoming_activations: Float[Array, 'max_connections'],
     ) -> Tuple[Float[Array, ''], NeuronState]:
         weights = neuron_state.weights
-        mask = neuron_state.active_connection_mask
+        mask = neuron_state.get_active_connection_mask()
         pre_activation = (incoming_activations * weights * mask).sum()
         activation_value = activation_fn(pre_activation)
 
@@ -82,7 +83,7 @@ def make_backprop_error_signal_fn(
     ) -> Float[Array, '']:
         next_incoming = next_layer_states.incoming_ids
         next_weights = next_layer_states.weights
-        next_conn_mask = next_layer_states.active_connection_mask
+        next_conn_mask = next_layer_states.get_active_connection_mask()
         next_errors = next_layer_states.error_signal
         next_active = next_layer_states.active_mask
 
@@ -129,7 +130,7 @@ def make_sgd_update_fn(
         delta = error_signal * act_deriv
 
         # Weight update: w -= lr * delta * incoming_activation
-        conn_mask = neuron_state.active_connection_mask
+        conn_mask = neuron_state.get_active_connection_mask()
         weight_grads = delta * incoming_activations * conn_mask
         new_weights = neuron_state.weights - learning_rate * weight_grads
 
@@ -165,17 +166,17 @@ def _select_random(
     mask: Bool[Array, 'n'],
     max_connections: int,
     key: jax.Array,
-) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+) -> Int[Array, 'max_connections']:
     """Randomly select up to max_connections indices where mask is True.
 
-    Uses shuffle + argsort to be JIT-compatible. Returns (incoming_ids, active_mask).
+    Uses shuffle + argsort to be JIT-compatible. Returns incoming_ids.
     """
     n_total = mask.shape[0]
     shuffled = jax.random.permutation(key, n_total)
     sort_keys = jnp.where(mask[shuffled], 0, 1)
     selected = shuffled[jnp.argsort(sort_keys)[:max_connections]]
     is_connected = mask[selected]
-    return jnp.where(is_connected, selected, 0), is_connected
+    return jnp.where(is_connected, selected, CONNECTION_PADDING)
 
 
 def random_connector(
@@ -183,7 +184,7 @@ def random_connector(
     index: Int[Array, ''],
     max_connections: int,
     key: jax.Array,
-) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+) -> Int[Array, 'max_connections']:
     """Randomly connect to neurons from the entire connectable set."""
     return _select_random(connectable_mask, max_connections, key)
 
@@ -202,7 +203,7 @@ def make_prior_layer_connector(
         index: Int[Array, ''],
         max_connections: int,
         key: jax.Array,
-    ) -> Tuple[Int[Array, 'max_connections'], Bool[Array, 'max_connections']]:
+    ) -> Int[Array, 'max_connections']:
         layer_k = (index - n_inputs) // max_hidden_per_layer
         prior_start = jnp.where(layer_k == 0, 0,
                                 n_inputs + (layer_k - 1) * max_hidden_per_layer)
@@ -232,9 +233,8 @@ def make_weight_init_fn(
 ) -> Callable:
     """Create a state_init_fn that initializes weights given a neuron with connectivity set.
 
-    The returned function receives a NeuronState that already has incoming_ids,
-    active_connection_mask, and active_mask set. It initializes weights (and
-    leaves other fields at their constructor defaults).
+    The returned function receives a NeuronState that already has incoming_ids and active_mask set.
+    It initializes weights (and leaves other fields at their constructor defaults).
 
     Args:
         weight_init: Callable (key, shape, dtype, fan_in) -> Array.
@@ -248,9 +248,10 @@ def make_weight_init_fn(
         neuron_state: NeuronState,
         key: jax.Array,
     ) -> NeuronState:
-        fan_in = neuron_state.active_connection_mask.sum()
+        active_connection_mask = neuron_state.get_active_connection_mask()
+        fan_in = active_connection_mask.sum()
         weights = weight_init(key, neuron_state.weights.shape, jnp.float32, fan_in)
-        weights = jnp.where(neuron_state.active_connection_mask, weights, 0.0)
+        weights = jnp.where(active_connection_mask, weights, 0.0)
         return tree_replace(neuron_state, weights=weights)
 
     return state_init_fn

@@ -289,7 +289,7 @@ def test_remove_connection_from_output(empty_net: Network, key: PRNGKeyArray):
     # Find which slot in the output connects to the first hidden neuron
     abs_first = int(net.get_units_in_layer(0)[0])
     output_ids = net.output_states.incoming_ids[0]
-    output_mask = net.output_states.active_connection_mask[0]
+    output_mask = net.output_states.get_active_connection_mask()[0]
     slot = None
     for s in range(output_ids.shape[0]):
         if output_mask[s] and int(output_ids[s]) == abs_first:

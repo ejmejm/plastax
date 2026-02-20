@@ -1,4 +1,5 @@
 from plastax.states import (
+    CONNECTION_PADDING,
     NeuronState,
     StructureUpdateState,
     tree_replace,
