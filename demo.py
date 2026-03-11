@@ -131,7 +131,6 @@ def train(state: TrainState, num_steps: int) -> TrainState:
         block_start = time.time()
         state, losses = jax.block_until_ready(train_block(state))
         block_elapsed = time.time() - block_start
-        print(f"Block elapsed: {block_elapsed:.2f} seconds")
         steps_per_sec = LOG_INTERVAL / block_elapsed
         print(f"Step {int(state.step):>6d} | Loss: {float(losses.mean()):.6f} | {steps_per_sec:.1f} steps/sec")
     return state

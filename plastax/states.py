@@ -10,7 +10,8 @@ class NeuronState(eqx.Module):
     """Core state for each neuron. Users subclass to add extra metadata."""
     active_mask: Bool[Array, '']
     incoming_ids: Int[Array, 'max_connections']
-    weights: Float[Array, 'max_connections']
+    weights: Float[Array, 'max_connections'] # Weight are for incoming connections only
+    outgoing_ids: Int[Array, 'max_connections']
     activation_value: Float[Array, '']
     error_signal: Float[Array, '']
 
@@ -18,6 +19,7 @@ class NeuronState(eqx.Module):
         self.active_mask = jnp.array(False)
         self.incoming_ids = jnp.full(max_connections, CONNECTION_PADDING, dtype=jnp.int32)
         self.weights = jnp.zeros(max_connections)
+        self.outgoing_ids = jnp.full(max_connections, CONNECTION_PADDING, dtype=jnp.int32)
         self.activation_value = jnp.array(0.0)
         self.error_signal = jnp.array(0.0)
         
